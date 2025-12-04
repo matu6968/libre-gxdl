@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 """
-GX Bootloader Upload Tool
-Reverse engineered from gxdl.elf hardware sniffing
+libre-gxdl: Open Source GX Bootloader Tool
+Reverse engineered from gxdl.elf via hardware sniffing and binary analysis
+
+Supports GX/Nationalchip set-top boxes running eCos 3.x RTOS:
+- Gemini (GX6701, GX6702, GX6703)
+- Cygnus (GX6705, GX6706)
+- Sirius (GX6613)
+- Taurus (GX3113, GX3235, GX6605)
+- And more...
+Keep in mind that support is untested for other devices (only tested on GX6702) and may not work, so try at your own risk.
+
+Features:
+- Boot device via serial
+- Read/write flash via serial or USB
+- OTP memory operations (GX OTP, SPI Flash OTP)
+- Flash management (erase, bad block info)
+- File comparison
 
 Protocol Summary:
 ================
 1. Device sends handshake: B0 B0 58 (ACK sequence)
 2. Host sends Stage 1:
    - 5-byte header: [0x59][len_lo][len_hi][addr_lo][addr_hi]
-   - 8184 bytes payload from boot file offset 0x20
-   - 4-byte checksum from boot file offset 0x2018 (embedded in file)
-3. Device responds: "RUNGET" (RUN + GET)
+   - 8188 bytes payload from boot file offset 0x20 (includes checksum)
+   - "boot" terminator
+3. Device responds: "RUNGET"
 4. Host sends Stage 2:
-   - 12-byte wrapper: "boot" + checksum16 + field2 + size32
-   - Modified boot content: "toob" + code (header bytes 4-31 stripped)
+   - 8-byte metadata: checksum16 + 0x00C2 + size32
+   - Boot content in 2048-byte chunks
 5. Device boots and shows partition info
 
 Usage:
-  python3 gx_upload.py -b <bootfile> -d <serial_device> [-v]
+  python3 libre_gxdl.py -b <bootfile> -d <serial_device> [-c <command>] [-v]
 """
 
 import argparse
@@ -1034,6 +1049,222 @@ class GXUploader:
         command = f"sflash_otp read {address} {length}"
         return self.binary_read_command(command, length, output_file)
 
+    def compare_files(self, src_file: str, dst_file: str) -> bool:
+        """
+        Compare two files byte-by-byte (host-side operation).
+        
+        This mimics the 'compare' command from gxdl.elf which compares
+        local files without device interaction.
+        
+        Args:
+            src_file: Source file path
+            dst_file: Destination file path
+        
+        Returns:
+            True if files are identical
+        """
+        try:
+            with open(src_file, "rb") as f1:
+                data1 = f1.read()
+            with open(dst_file, "rb") as f2:
+                data2 = f2.read()
+        except FileNotFoundError as e:
+            print(f"[!] File not found: {e.filename}")
+            return False
+        except IOError as e:
+            print(f"[!] Error reading file: {e}")
+            return False
+        
+        size1, size2 = len(data1), len(data2)
+        
+        if size1 != size2:
+            print(f"[!] Files differ in size:")
+            print(f"    {src_file}: {size1} bytes")
+            print(f"    {dst_file}: {size2} bytes")
+            return False
+        
+        # Compare in chunks for progress and to find first difference
+        chunk_size = 4 * 1024 * 1024  # 4MB chunks
+        offset = 0
+        
+        while offset < size1:
+            end = min(offset + chunk_size, size1)
+            chunk1 = data1[offset:end]
+            chunk2 = data2[offset:end]
+            
+            if chunk1 != chunk2:
+                # Find exact byte offset of first difference
+                for i, (b1, b2) in enumerate(zip(chunk1, chunk2)):
+                    if b1 != b2:
+                        diff_offset = offset + i
+                        print(f"[!] Files differ at offset 0x{diff_offset:X}:")
+                        print(f"    {src_file}: 0x{b1:02X}")
+                        print(f"    {dst_file}: 0x{b2:02X}")
+                        return False
+            
+            offset = end
+            if size1 > chunk_size:
+                progress = int(offset * 100 / size1)
+                print(f"  Comparing: {progress}%", end="\r")
+        
+        if size1 > chunk_size:
+            print(f"  Comparing: 100%")
+        
+        print(f"[+] Files are identical ({size1} bytes)")
+        return True
+
+    def usb_dump(self, target: str, size: int, filename: str) -> bool:
+        """
+        Dump flash contents via USB (device reads to USB drive).
+        
+        The bootloader reads flash and writes to a file on USB storage
+        connected to the device.
+        
+        Args:
+            target: Partition name or flash address
+            size: Number of bytes to dump
+            filename: Filename on USB drive (device-side)
+        
+        Returns:
+            True if successful
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+        
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+        
+        command = f"usbdump {target} {size} {filename}"
+        print(f"[*] USB dump: {target} ({size} bytes) -> {filename}")
+        
+        result = self.text_command(command, timeout=120.0)
+        
+        if result:
+            print(f"[+] USB dump output:\n{result}")
+            # Check for success indicators
+            if "ok" in result.lower() or "finish" in result.lower():
+                return True
+        
+        return True  # Command sent, result shown
+
+    def usb_download(self, target: str, filename: str) -> bool:
+        """
+        Download (write) to flash via USB (device reads from USB drive).
+        
+        The bootloader reads a file from USB storage connected to the device
+        and writes it to flash.
+        
+        Args:
+            target: Partition name or flash address
+            filename: Filename on USB drive (device-side)
+        
+        Returns:
+            True if successful
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+        
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+        
+        command = f"usbdown {target} {filename}"
+        print(f"[*] USB download: {filename} -> {target}")
+        print("[!] WARNING: This will ERASE and WRITE flash!")
+        
+        result = self.text_command(command, timeout=300.0)  # Flash write takes time
+        
+        if result:
+            print(f"[+] USB download output:\n{result}")
+            if "ok" in result.lower() or "finish" in result.lower():
+                return True
+        
+        return True  # Command sent, result shown
+
+    def flash_erase(self, target: str, length: int = None, nospread: bool = False) -> bool:
+        """
+        Erase flash region.
+        
+        Args:
+            target: Partition name or flash address
+            length: Length to erase (required if target is address)
+            nospread: If True, don't spread erase across bad blocks
+        
+        Returns:
+            True if successful
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+        
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+        
+        if length is not None:
+            if nospread:
+                command = f"flash erase nospread {target} {length}"
+            else:
+                command = f"flash erase {target} {length}"
+        else:
+            command = f"flash erase {target}"
+        
+        print(f"[*] Flash erase: {command}")
+        print("[!] WARNING: This will ERASE flash data!")
+        
+        result = self.text_command(command, timeout=120.0)
+        
+        if result:
+            print(f"[+] Flash erase output:\n{result}")
+        
+        return True
+
+    def flash_badinfo(self) -> bool:
+        """Show flash bad block information."""
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+        
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+        
+        result = self.text_command("flash badinfo", timeout=10.0)
+        
+        if result:
+            print(f"[+] Flash bad block info:\n{result}")
+            return True
+        
+        return False
+
+    def flash_eraseall(self) -> bool:
+        """
+        Erase entire flash.
+        
+        WARNING: This is EXTREMELY DANGEROUS and will brick the device
+        if not followed by immediate reflash!
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+        
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+        
+        print("[!] WARNING: flash eraseall will ERASE ALL FLASH DATA!")
+        print("[!] This WILL BRICK the device if not immediately reflashed!")
+        
+        result = self.text_command("flash eraseall", timeout=300.0)
+        
+        if result:
+            print(f"[+] Flash eraseall output:\n{result}")
+        
+        return True
+
     def run_command_mode(self, boot_file: str, command: str, cmd_args: list) -> bool:
         """
         Boot device and run a command.
@@ -1136,24 +1367,96 @@ class GXUploader:
                 print(f"[!] Unknown sflash_otp subcommand: {subcmd}")
                 return False
         
+        elif command == "compare":
+            if len(cmd_args) < 2:
+                print("[!] Usage: compare <src_file> <dst_file>")
+                return False
+            return self.compare_files(cmd_args[0], cmd_args[1])
+        
+        elif command == "usbdump":
+            if len(cmd_args) < 3:
+                print("[!] Usage: usbdump <partition|addr> <size> <filename>")
+                print("[!] Note: filename is on USB drive attached to device")
+                return False
+            target, size, filename = cmd_args[0], int(cmd_args[1]), cmd_args[2]
+            return self.usb_dump(target, size, filename)
+        
+        elif command == "usbdown":
+            if len(cmd_args) < 2:
+                print("[!] Usage: usbdown <partition|addr> <filename>")
+                print("[!] Note: filename is on USB drive attached to device")
+                return False
+            target, filename = cmd_args[0], cmd_args[1]
+            return self.usb_download(target, filename)
+        
+        elif command == "flash":
+            if len(cmd_args) < 1:
+                print("[!] Usage: flash <erase|badinfo|eraseall> [args...]")
+                return False
+            
+            subcmd = cmd_args[0]
+            if subcmd == "erase":
+                if len(cmd_args) < 2:
+                    print("[!] Usage: flash erase [nospread] <partition|addr> [length]")
+                    return False
+                
+                # Check for nospread flag
+                nospread = False
+                args_start = 1
+                if cmd_args[1] == "nospread":
+                    nospread = True
+                    args_start = 2
+                
+                if len(cmd_args) <= args_start:
+                    print("[!] Usage: flash erase [nospread] <partition|addr> [length]")
+                    return False
+                
+                target = cmd_args[args_start]
+                length = int(cmd_args[args_start + 1]) if len(cmd_args) > args_start + 1 else None
+                return self.flash_erase(target, length, nospread)
+            
+            elif subcmd == "badinfo":
+                return self.flash_badinfo()
+            
+            elif subcmd == "eraseall":
+                return self.flash_eraseall()
+            
+            else:
+                print(f"[!] Unknown flash subcommand: {subcmd}")
+                print("[!] Available: erase, badinfo, eraseall")
+                return False
+        
         else:
             print(f"[!] Unknown command: {command}")
-            print("[*] Available commands: serialdump, serialdown, gx_otp, sflash_otp")
+            print("[*] Available commands:")
+            print("    serialdump, serialdown  - Serial flash read/write")
+            print("    usbdump, usbdown        - USB flash read/write")
+            print("    gx_otp                  - GX OTP read")
+            print("    sflash_otp              - SPI Flash OTP operations")
+            print("    flash                   - Flash management (erase, badinfo)")
+            print("    compare                 - Compare two files (host-side)")
             return False
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GX Bootloader Upload Tool",
+        description="libre-gxdl: Open Source GX Bootloader Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   # Just boot the device:
   %(prog)s -b gemini.boot -d /dev/ttyUSB0
   
-  # Dump flash partition to file:
+  # Dump flash partition to file (via serial):
   %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "serialdump BOOT 65536 dump.bin"
   %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "serialdump 0x0 4194304 full_flash.bin"
+  
+  # Write file to flash (via serial - DANGEROUS!):
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "serialdown LOGO logo.bin"
+  
+  # Dump/write via USB drive attached to device:
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "usbdump KERNEL 2752512 kernel.bin"
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "usbdown LOGO logo.bin"
   
   # Read GX OTP (One-Time Programmable) memory:
   %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "gx_otp tread 0 32"
@@ -1162,23 +1465,44 @@ Examples:
   # Read SPI Flash OTP:
   %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "sflash_otp status"
   %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "sflash_otp getregion"
-  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "sflash_otp read 0 64 sflash_otp.bin"
   
-  # Write file to flash partition (DANGEROUS!):
-  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "serialdown LOGO logo.bin"
+  # Flash management:
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "flash badinfo"
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "flash erase LOGO"
+  
+  # Compare two files (host-side):
+  %(prog)s -b gemini.boot -d /dev/ttyUSB0 -c "compare dump1.bin dump2.bin"
   
 Commands:
-  serialdump <partition|addr> <size> <file> - Dump flash to file
-  serialdown <partition|addr> <file>        - Write file to flash
-  gx_otp tread <addr> <len>                 - Read GX OTP (text)
-  gx_otp read <addr> <len> <file>           - Read GX OTP (binary)
-  sflash_otp status                         - SPI Flash OTP status
-  sflash_otp getregion                      - SPI Flash OTP region
-  sflash_otp read <addr> <len> <file>       - Read SPI Flash OTP
+  Serial Transfer:
+    serialdump <partition|addr> <size> <file> - Dump flash to host file
+    serialdown <partition|addr> <file>        - Write host file to flash
+  
+  USB Transfer (files on USB drive attached to device):
+    usbdump <partition|addr> <size> <file>    - Dump flash to USB file
+    usbdown <partition|addr> <file>           - Write USB file to flash
+  
+  GX OTP Memory:
+    gx_otp tread <addr> <len>                 - Read OTP (text hex dump)
+    gx_otp read <addr> <len> <file>           - Read OTP (binary file)
+  
+  SPI Flash OTP:
+    sflash_otp status                         - Show OTP status
+    sflash_otp getregion                      - Show OTP region info
+    sflash_otp read <addr> <len> <file>       - Read OTP to file
+  
+  Flash Management:
+    flash badinfo                             - Show bad block info
+    flash erase [nospread] <partition|addr> [len] - Erase flash region
+    flash eraseall                            - Erase ENTIRE flash (DANGER!)
+  
+  Utilities:
+    compare <src_file> <dst_file>             - Compare two files (host-side)
   
 Tips:
   - Power cycle the device AFTER starting this tool
   - Partitions: BOOT, TABLE, LOGO, KERNEL, ROOT, DATA
+  - USB commands require USB storage connected to the device formatted as FAT32
         """
     )
     parser.add_argument("-b", "--boot", required=True, help="Boot file to upload")

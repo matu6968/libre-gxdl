@@ -1,24 +1,26 @@
-# Libre NationalChip GX series downloader
+# libre-gxdl: Open Source NationalChip GX Series Downloader
 
-This is a open source reimplemenation of the GX series downloader (also known as gxdl) by using reverse engineering at the hardware serial level + radare2.
+This is an open source reimplementation of the GX series downloader (also known as gxdl) created through reverse engineering at the hardware serial level + radare2 binary analysis.
 
 ## Features
 
-- Supports GX series devices (only tested on GX6702, others use with caution)
-- Read/writing of the flash partitions (serialdown/serialdump)
-- Reading of the OTP memory (writing unimplemented, gx_otp read/tread)
-- Reading of the SPI Flash status (sflash_otp status/getregion)
+- Supports GX series devices (tested on GX6702, others may work but use caution)
+- Boot device via serial
+- Read/write flash partitions via serial (`serialdump`/`serialdown`)
+- Read/write flash partitions via USB drive attached to device (`usbdump`/`usbdown`)
+- Read GX OTP memory (`gx_otp read`/`tread`)
+- Read SPI Flash OTP status (`sflash_otp status`/`getregion`/`read`)
+- Flash management (`flash erase`/`badinfo`/`eraseall`)
+- File comparison (`compare`)
 
-## Unimplemented features
+## Unimplemented Features
 
-- Writing of the OTP memory (gx_otp write/twrite)
-- Reading/writing of the SPI Flash OTP (sflash_otp read/write)
-- EEPROM reading/writing (eeprom_read/eeprom_write, does not work on all devices)
-- `compare` command
-- `flash` commands
-- `usb*` commands
-- `net*` commands
-- `load_conf_down` command
+- Writing of the OTP memory (`gx_otp write`/`twrite`) - reason: OTP writing is risky and can brick the device
+- Writing of the SPI Flash OTP (`sflash_otp write`/`lock`/`erase`/`setregion`) - reason: SPI Flash OTP writing is risky, can brick the device and prevent it from ever being recovered
+- EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported by all devices
+- Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a network interface
+- Configuration loading (`load_conf_down`) - reason: Configuration loading is complex, will be implemented at a later stage
+- Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash
 
 ## Usage
 
@@ -66,6 +68,29 @@ python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c
 To read the SPI Flash OTP, use the `sflash_otp getregion` command.
 ```bash
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp getregion"
+```
+
+To dump/write flash via USB drive attached to device:
+```bash
+# Dump KERNEL partition to USB drive (file created on device's USB)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "usbdump KERNEL 2752512 kernel.bin"
+
+# Write logo from USB drive to flash (file must exist on device's USB)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "usbdown LOGO logo.bin"
+```
+
+To manage flash:
+```bash
+# Show bad block information
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash badinfo"
+
+# Erase a partition
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash erase LOGO"
+```
+
+To compare two files (host-side operation):
+```bash
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "compare dump1.bin dump2.bin"
 ```
 
 ## Protocol specifications

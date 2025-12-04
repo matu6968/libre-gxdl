@@ -138,7 +138,7 @@ Different chips use different chunk sizes:
 # Using the gx_upload.py tool
 python3 tools/gx_upload.py -b gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -v
 
-# The device needs to be in bootloader mode (typically by holding a button during power-on)
+# The device needs to be in BootROM mode (typically within less then a second after power-on)
 ```
 
 ## Device Output Example
@@ -282,12 +282,15 @@ Uses the same `~sta~/~crc~/~fin~` protocol as serialdump.
 
 | ID | Name | Address | Size | Description |
 |----|------|---------|------|-------------|
-| 0 | BOOT | 0x000000 | 64 KB | Bootloader |
+| 0 | BOOT | 0x000000 | 64 KB | GxLoader bootloader |
 | 1 | TABLE | 0x010000 | 512 B | Partition table |
-| 2 | LOGO | 0x010200 | 65024 B | Boot logo |
-| 3 | KERNEL | 0x020000 | 2688 KB | Linux kernel (romfs) |
+| 2 | LOGO | 0x010200 | 65024 B | Boot logo (JPEG/PNG) |
+| 3 | KERNEL | 0x020000 | 2688 KB | eCos 3.x RTOS kernel + embedded romfs |
 | 4 | ROOT | 0x2c0000 | 832 KB | Root filesystem (cramfs) |
-| 5 | DATA | 0x390000 | 448 KB | Data partition (minifs) |
+| 5 | DATA | 0x390000 | 448 KB | User data partition (minifs)
+
+**Note:** These devices typically run eCos 3.x RTOS due to low flash sizes (typically 4MB). The kernel includes statically 
+linked utilities like SDL 2 (UI), ntfs-3g (NTFS driver for USB storage), WiFi/Ethernet firmware, etc from analysis of the KERNEL partition.
 
 ## Notes
 
