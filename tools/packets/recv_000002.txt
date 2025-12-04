@@ -1,0 +1,5 @@
+Timestamp: 2025-12-04 18:39:29.956971
+Direction: recv
+Length: 6 bytes
+
+52 55 4E 47 45 54
