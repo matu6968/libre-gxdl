@@ -18,7 +18,7 @@ This is an open source reimplementation of the GX series downloader (also known 
 - Writing of the OTP memory (`gx_otp write`/`twrite`) - reason: OTP writing is risky and can brick the device
 - Writing of the SPI Flash OTP (`sflash_otp write`/`lock`/`erase`/`setregion`) - reason: SPI Flash OTP writing is risky, can brick the device and prevent it from ever being recovered
 - EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported by all devices
-- Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a network interface
+- Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a Ethernet interface which can't be tested due to lack of supported hardware
 - Configuration loading (`load_conf_down`) - reason: Configuration loading is complex, will be implemented at a later stage
 - Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash
 
@@ -43,6 +43,25 @@ Flash type  : EN25Q32
 Flash size  : 4 MB
 cpu freq    : 594 MHz
 memory freq : 672 MHz
+```
+
+On older bootloaders (like on the GX6605 series) the board type can be seen in a different section:
+```
+GxLoader v1.9.6-x 20170220 
+
+
+
+cpu family	: CSKY
+
+chip model	: gx6605s <-- This is the key value to determine which boot file to use
+
+board type	: generic
+
+memory size	: 64 MB
+
+Flash type	: mx25l32
+
+Flash size	: 4 MB
 ```
 To specify the bootloader file, use the `-b` argument.
 
