@@ -1051,6 +1051,141 @@ class GXUploader:
         command = f"gx_otp tread {address} {length}"
         return self.text_command(command, timeout=5.0)
 
+    def gx_otp_write(self, address: int, input_file: str) -> bool:
+        """
+        Write binary data to GX OTP.
+        Protocol is assumed to mirror serialdown: command with length, ~sta~, data, ~crc~, checksum, ~fin~.
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        try:
+            with open(input_file, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            print(f"[!] Input file not found: {input_file}")
+            return False
+        except IOError as e:
+            print(f"[!] Error reading file: {e}")
+            return False
+
+        size = len(data)
+        print(f"[*] Writing {size} bytes to GX OTP at 0x{address:X}...")
+
+        # Wait for prompt
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        command = f"gx_otp write {address} {size}"
+        success, extra = self.send_command(command, timeout=5.0)
+        if not success:
+            print("[!] Command not echoed back")
+            return False
+
+        # Wait for ~sta~
+        buffer = bytearray(extra)
+        start = time.time()
+        while time.time() - start < 10.0:
+            if b"~sta~" in buffer:
+                break
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+            time.sleep(0.01)
+        else:
+            print("[!] Timeout waiting for ~sta~ marker")
+            return False
+
+        self.log("Device ready, sending OTP data...")
+
+        # Send data with GX checksum
+        chunk_size = 1024
+        bytes_sent = 0
+        GX_KEY = bytes([0x12, 0x34, 0x56, 0x78])
+        checksum = 0
+
+        while bytes_sent < size:
+            chunk = data[bytes_sent:bytes_sent + chunk_size]
+            self.ser.write(chunk)
+
+            for i, byte in enumerate(chunk):
+                checksum += GX_KEY[(bytes_sent + i) % 4] ^ byte
+
+            bytes_sent += len(chunk)
+            progress = int(bytes_sent * 100 / size)
+            if progress % 5 == 0:
+                print(f"  Progress: {progress}%", end="\r")
+
+        termios.tcdrain(self.ser.fileno())
+        print("  Progress: 100%")
+
+        # Wait for ~crc~
+        buffer = bytearray()
+        start = time.time()
+        self.log("[*] Waiting for CRC request...")
+        while time.time() - start < 10.0:
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+                if b"~crc~" in buffer:
+                    break
+            time.sleep(0.01)
+        else:
+            print(f"[!] Timeout waiting for ~crc~ marker. Got: {buffer}")
+            return False
+
+        # Send checksum (GX custom)
+        checksum_bytes = struct.pack(">I", checksum & 0xFFFFFFFF)
+        self.ser.write(checksum_bytes)
+        termios.tcdrain(self.ser.fileno())
+        self.log(f"Sent checksum: 0x{(checksum & 0xFFFFFFFF):08X}")
+
+        # Wait for completion
+        buffer = bytearray()
+        start = time.time()
+        timeout = 60.0
+        print("[*] Waiting for OTP write completion...")
+        while time.time() - start < timeout:
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+
+                if b"~fin~" in buffer:
+                    self.log("Got ~fin~ marker")
+                    print("[+] GX OTP write complete!")
+                    return True
+                if b"boot>" in buffer:
+                    print("[+] GX OTP write complete (prompt returned).")
+                    return True
+                if b"err" in buffer.lower():
+                    print(f"[!] Error during OTP write:\n{buffer.decode('latin-1', errors='replace')}")
+                    return False
+            time.sleep(0.01)
+
+        print(f"[!] Timeout waiting for completion. Received:\n{buffer.decode('latin-1', errors='replace')}")
+        return False
+
+    def gx_otp_twrite(self, address: int, hex_string: str) -> bool:
+        """
+        Text-based OTP write using hex digits (as provided by gxdl.elf usage).
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        command = f"gx_otp twrite {address} {hex_string}"
+        result = self.text_command(command, timeout=30.0)
+        if result:
+            print(f"[+] GX OTP twrite response:\n{result}")
+            return True
+        return True
+
     def sflash_otp_status(self) -> str:
         """Get SPI Flash OTP status."""
         return self.text_command("sflash_otp status", timeout=5.0)
@@ -1063,6 +1198,137 @@ class GXUploader:
         """Read SPI Flash OTP to file."""
         command = f"sflash_otp read {address} {length}"
         return self.binary_read_command(command, length, output_file)
+
+    def sflash_otp_write(self, address: int, input_file: str) -> bool:
+        """
+        Write data to SPI Flash OTP (DANGEROUS / irreversible).
+        Protocol assumed to mirror serialdown/gx_otp write: command with length, ~sta~, data, ~crc~, checksum, ~fin~.
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        try:
+            with open(input_file, "rb") as f:
+                data = f.read()
+        except FileNotFoundError:
+            print(f"[!] Input file not found: {input_file}")
+            return False
+        except IOError as e:
+            print(f"[!] Error reading file: {e}")
+            return False
+
+        size = len(data)
+        print(f"[*] Writing {size} bytes to SPI Flash OTP at 0x{address:X} (DANGEROUS)...")
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        command = f"sflash_otp write {address} {size}"
+        success, extra = self.send_command(command, timeout=5.0)
+        if not success:
+            print("[!] Command not echoed back")
+            return False
+
+        # Wait for ~sta~
+        buffer = bytearray(extra)
+        start = time.time()
+        while time.time() - start < 10.0:
+            if b"~sta~" in buffer:
+                break
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+            time.sleep(0.01)
+        else:
+            print("[!] Timeout waiting for ~sta~ marker")
+            return False
+
+        self.log("Device ready, sending OTP data...")
+
+        # Send data with GX checksum
+        chunk_size = 1024
+        bytes_sent = 0
+        GX_KEY = bytes([0x12, 0x34, 0x56, 0x78])
+        checksum = 0
+
+        while bytes_sent < size:
+            chunk = data[bytes_sent:bytes_sent + chunk_size]
+            self.ser.write(chunk)
+            for i, byte in enumerate(chunk):
+                checksum += GX_KEY[(bytes_sent + i) % 4] ^ byte
+            bytes_sent += len(chunk)
+            progress = int(bytes_sent * 100 / size)
+            if progress % 5 == 0:
+                print(f"  Progress: {progress}%", end="\r")
+
+        termios.tcdrain(self.ser.fileno())
+        print("  Progress: 100%")
+
+        # Wait for ~crc~
+        buffer = bytearray()
+        start = time.time()
+        self.log("[*] Waiting for CRC request...")
+        while time.time() - start < 10.0:
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+                if b"~crc~" in buffer:
+                    break
+            time.sleep(0.01)
+        else:
+            print(f"[!] Timeout waiting for ~crc~ marker. Got: {buffer}")
+            return False
+
+        # Send checksum (GX custom)
+        checksum_bytes = struct.pack(">I", checksum & 0xFFFFFFFF)
+        self.ser.write(checksum_bytes)
+        termios.tcdrain(self.ser.fileno())
+        self.log(f"Sent checksum: 0x{(checksum & 0xFFFFFFFF):08X}")
+
+        # Wait for completion
+        buffer = bytearray()
+        start = time.time()
+        timeout = 60.0
+        print("[*] Waiting for SPI OTP write completion...")
+        while time.time() - start < timeout:
+            if self.ser.in_waiting:
+                recv = self.ser.read(self.ser.in_waiting)
+                buffer.extend(recv)
+                if b"~fin~" in buffer:
+                    self.log("Got ~fin~ marker")
+                    print("[+] SPI Flash OTP write complete!")
+                    return True
+                if b"boot>" in buffer:
+                    print("[+] SPI Flash OTP write complete (prompt returned).")
+                    return True
+                if b"err" in buffer.lower():
+                    print(f"[!] Error during SPI OTP write:\n{buffer.decode('latin-1', errors='replace')}")
+                    return False
+            time.sleep(0.01)
+
+        print(f"[!] Timeout waiting for completion. Received:\n{buffer.decode('latin-1', errors='replace')}")
+        return False
+
+    def sflash_otp_erase(self) -> bool:
+        """
+        Erase SPI Flash OTP region (DANGEROUS / irreversible).
+        """
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        command = "sflash_otp erase"
+        print("[*] Erasing SPI Flash OTP region (DANGEROUS)...")
+        result = self.text_command(command, timeout=30.0)
+        if result:
+            print(f"[+] sflash_otp erase response:\n{result}")
+        return True
 
     def compare_files(self, src_file: str, dst_file: str) -> bool:
         """
@@ -1326,7 +1592,7 @@ class GXUploader:
         
         elif command == "gx_otp":
             if len(cmd_args) < 1:
-                print("[!] Usage: gx_otp <read|tread> <address> <length> [output_file]")
+                print("[!] Usage: gx_otp <read|tread|write|twrite> <address> <length|file|hex> [output_file]")
                 return False
             
             subcmd = cmd_args[0]
@@ -1347,13 +1613,27 @@ class GXUploader:
                     print(f"[+] GX OTP data:\n{result}")
                     return True
                 return False
+            elif subcmd == "write":
+                if len(cmd_args) < 3:
+                    print("[!] Usage: gx_otp write <address> <input_file>")
+                    return False
+                addr = int(cmd_args[1])
+                input_file = cmd_args[2]
+                return self.gx_otp_write(addr, input_file)
+            elif subcmd == "twrite":
+                if len(cmd_args) < 3:
+                    print("[!] Usage: gx_otp twrite <address> <hex_digits_string>")
+                    return False
+                addr = int(cmd_args[1])
+                hex_string = cmd_args[2]
+                return self.gx_otp_twrite(addr, hex_string)
             else:
                 print(f"[!] Unknown gx_otp subcommand: {subcmd}")
                 return False
         
         elif command == "sflash_otp":
             if len(cmd_args) < 1:
-                print("[!] Usage: sflash_otp <status|getregion|read> [args...]")
+                print("[!] Usage: sflash_otp <status|getregion|read|write|erase> [args...]")
                 return False
             
             subcmd = cmd_args[0]
@@ -1377,6 +1657,17 @@ class GXUploader:
                     return False
                 addr, length, output_file = int(cmd_args[1]), int(cmd_args[2]), cmd_args[3]
                 return self.sflash_otp_read(addr, length, output_file)
+            
+            elif subcmd == "write":
+                if len(cmd_args) < 3:
+                    print("[!] Usage: sflash_otp write <address> <input_file>")
+                    return False
+                addr = int(cmd_args[1])
+                input_file = cmd_args[2]
+                return self.sflash_otp_write(addr, input_file)
+
+            elif subcmd == "erase":
+                return self.sflash_otp_erase()
             
             else:
                 print(f"[!] Unknown sflash_otp subcommand: {subcmd}")
@@ -1500,11 +1791,15 @@ Commands:
   GX OTP Memory:
     gx_otp tread <addr> <len>                 - Read OTP (text hex dump)
     gx_otp read <addr> <len> <file>           - Read OTP (binary file)
+    gx_otp write <addr> <file>                - Write OTP (binary) [DANGEROUS]
+    gx_otp twrite <addr> <hex>                - Write OTP (hex string) [DANGEROUS]
   
   SPI Flash OTP:
     sflash_otp status                         - Show OTP status
     sflash_otp getregion                      - Show OTP region info
     sflash_otp read <addr> <len> <file>       - Read OTP to file
+    sflash_otp write <addr> <file>            - Write OTP (binary) [DANGEROUS]
+    sflash_otp erase                          - Erase OTP region [DANGEROUS]
   
   Flash Management:
     flash badinfo                             - Show bad block info

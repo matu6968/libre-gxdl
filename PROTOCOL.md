@@ -258,6 +258,24 @@ gx_otp read <address> <length>
 ```
 Uses the same `~sta~/~crc~/~fin~` protocol as serialdump.
 
+**Write OTP (binary file) - DANGEROUS / irreversible:**
+```
+gx_otp write <address> <length>
+```
+Protocol (mirrors serialdown):
+1. Host sends command with address and length.
+2. Device echoes and sends `~sta~`.
+3. Host sends raw data (1024-byte chunks).
+4. Device sends `~crc~`.
+5. Host sends 4-byte GX checksum (big-endian) using the same XOR-sum as serialdown.
+6. Device sends `~fin~` and writes OTP.
+
+**Write OTP (hex string) - DANGEROUS / irreversible:**
+```
+gx_otp twrite <address> <hex_digits_string>
+```
+Text-mode write, response is textual (no binary stream).
+
 ### SPI Flash OTP Commands
 
 **Status:**
@@ -277,6 +295,24 @@ Returns the OTP region number.
 sflash_otp read <address> <length>
 ```
 Uses the same `~sta~/~crc~/~fin~` protocol as serialdump.
+
+**Write (binary) - DANGEROUS / irreversible:**
+```
+sflash_otp write <address> <length>
+```
+Assumed protocol (matches gx_otp/serialdown):
+1. Host sends command with address and length.
+2. Device echoes and sends `~sta~`.
+3. Host sends raw data (1024-byte chunks).
+4. Device sends `~crc~`.
+5. Host sends 4-byte GX checksum (big-endian) using the XOR-sum key `[12 34 56 78]`.
+6. Device sends `~fin~` and writes OTP.
+
+**Erase (device-defined scope) - DANGEROUS / irreversible:**
+```
+sflash_otp erase
+```
+Text-mode command; response is textual.
 
 ### Available Partitions
 

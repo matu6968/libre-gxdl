@@ -8,19 +8,18 @@ This is an open source reimplementation of the GX series downloader (also known 
 - Boot device via serial
 - Read/write flash partitions via serial (`serialdump`/`serialdown`)
 - Read/write flash partitions via USB drive attached to device (`usbdump`/`usbdown`)
-- Read GX OTP memory (`gx_otp read`/`tread`)
-- Read SPI Flash OTP status (`sflash_otp status`/`getregion`/`read`)
+- Read/write GX OTP memory (`gx_otp read`/`tread`/`write`/`twrite`) **DANGEROUS**
+- Read/erase/write SPI Flash OTP (`sflash_otp status`/`getregion`/`read`/`write`/`erase`) **DANGEROUS**
 - Flash management (`flash erase`/`badinfo`/`eraseall`)
 - File comparison (`compare`)
 
 ## Unimplemented Features
 
-- Writing of the OTP memory (`gx_otp write`/`twrite`) - reason: OTP writing is risky and can brick the device
-- Writing of the SPI Flash OTP (`sflash_otp write`/`lock`/`erase`/`setregion`) - reason: SPI Flash OTP writing is risky, can brick the device and prevent it from ever being recovered
+- Writing of the SPI Flash OTP region configuration (`sflash_otp lock/setregion`) - reason: OTP config writes are risky and can permanently brick devices
 - EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported by all devices
 - Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a Ethernet interface which can't be tested due to lack of supported hardware
 - Configuration loading (`load_conf_down`) - reason: Configuration loading is complex, will be implemented at a later stage
-- Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash
+- Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash, this option is also not supported by all devices
 
 ## Usage
 
@@ -80,6 +79,26 @@ python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c
 To read the SPI Flash OTP, use the `sflash_otp getregion` command.
 ```bash
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp getregion"
+```
+
+To write GX OTP (DANGEROUS, irreversible):
+```bash
+# Write 16 zero bytes at OTP address 0 (example)
+dd if=/dev/zero bs=16 count=1 of=/tmp/otp_zeros.bin
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "gx_otp write 0 /tmp/otp_zeros.bin"
+
+# Text-mode write with hex string (example writes 0x00010203)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "gx_otp twrite 0 00010203"
+```
+
+To write/erase SPI Flash OTP (DANGEROUS, irreversible):
+```bash
+# Write 16 zero bytes at OTP address 0x100 (example)
+dd if=/dev/zero bs=16 count=1 of=/tmp/sflash_otp_zeros.bin
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp write 0x100 /tmp/sflash_otp_zeros.bin"
+
+# Erase SPI Flash OTP region (device-defined scope)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp erase"
 ```
 
 To dump/write flash via USB drive attached to device:
