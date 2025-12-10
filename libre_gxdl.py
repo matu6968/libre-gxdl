@@ -516,9 +516,15 @@ class GXUploader:
         return header, payload, terminator
 
     def wait_for_prompt(self, timeout: float = 5.0) -> bool:
-        """Wait for 'boot> ' prompt"""
+        """
+        Wait for 'boot>' prompt. If nothing arrives shortly, send a newline to
+        coax the prompt to reappear (helps when the previous prompt was already
+        consumed).
+        """
         buffer = bytearray()
         start = time.time()
+        poked = False
+        fd = self.ser.fileno()
         
         while time.time() - start < timeout:
             if self.ser.in_waiting:
@@ -526,7 +532,16 @@ class GXUploader:
                 buffer.extend(data)
                 if b"boot> " in buffer or b"boot>" in buffer:
                     return True
-            time.sleep(0.01)
+            else:
+                # If no data yet, send a newline once to trigger prompt output
+                if not poked and time.time() - start > 0.2:
+                    try:
+                        self.ser.write(b"\n")
+                        termios.tcdrain(fd)
+                    except Exception:
+                        pass
+                    poked = True
+                time.sleep(0.01)
         
         return False
 

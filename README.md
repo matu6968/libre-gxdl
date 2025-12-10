@@ -45,22 +45,15 @@ cpu freq    : 594 MHz
 memory freq : 672 MHz
 ```
 
-On older bootloaders (like on the GX6605 series) the board type can be seen in a different section:
+In some bootloaders (like on the GX6605 series) the board type can be seen in a different section:
 ```
 GxLoader v1.9.6-x 20170220 
 
-
-
 cpu family	: CSKY
-
 chip model	: gx6605s <-- This is the key value to determine which boot file to use
-
 board type	: generic
-
 memory size	: 64 MB
-
 Flash type	: mx25l32
-
 Flash size	: 4 MB
 ```
 To specify the bootloader file, use the `-b` argument.
