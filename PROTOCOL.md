@@ -205,6 +205,15 @@ gx_upload.py -b gemini.boot -d /dev/ttyUSB0 -c "serialdump BOOT 65536 dump.bin"
 gx_upload.py -b gemini.boot -d /dev/ttyUSB0 -c "serialdump 0x0 4194304 full.bin"
 ```
 
+### Transfer Modes
+
+The vendor downloader also supports a transfer mode flag, exposed in this tool as `-t` / `--transfer-mode`.
+
+- `s` (default): upload the `.boot` image and boot into the downloader.
+- `nns`: skip the `.boot` upload when the device is already in command mode; this matches the vendor downloader's `-t nns` behavior.
+
+This is useful when the device is already sitting at the `boot>` prompt and you just want to issue commands without retransferring the boot image.
+
 ### Serial Download (serialdown)
 
 Writes data to flash.
@@ -243,6 +252,31 @@ checksum = sum(KEY[i % 4] ^ data[i] for i in range(len(data)))
 The checksum is NOT CRC32. It's a simple XOR-sum using a repeating 4-byte key.
 
 **Warning:** Writing to flash can brick the device! Always have a backup.
+
+### Config-file execution (`load_conf_down`)
+
+The vendor downloader exposes a configuration-loading command, `load_conf_down`, whose behavior is mirrored in this tool.
+
+**Command Format:**
+```
+load_conf_down <config_file> <transport> [transport_path]
+```
+
+**Behavior:**
+1. The host opens the config file and reads it line by line.
+2. Each non-comment line is parsed as a downloader command.
+3. Commands are executed sequentially in the current `boot>` session.
+
+**Supported command forms:**
+- `serialdown <partition|address> <file>`
+- `serialdump <partition|address> <size> <file>`
+- `usbdown <partition|address> <file>`
+- `usbdump <partition|address> <file>`
+- `flash erase [nospread] <partition|address> [length]`
+- `flash badinfo`
+- `flash eraseall`
+
+The parser is intentionally lightweight and follows the simple command-per-line style visible in the vendor binary's config-loading path.
 
 ### GX OTP Commands
 

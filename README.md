@@ -11,14 +11,15 @@ This is an open source reimplementation of the GX series downloader (also known 
 - Read/write GX OTP memory (`gx_otp read`/`tread`/`write`/`twrite`) **DANGEROUS**
 - Read/erase/write SPI Flash OTP (`sflash_otp status`/`getregion`/`read`/`write`/`erase`) **DANGEROUS**
 - Flash management (`flash erase`/`badinfo`/`eraseall`)
+- Configuration loading via `load_conf_down` using vendor-style config files
+- Transfer mode support for `-t nns` to skip boot-image transfer when already in command mode
 - File comparison (`compare`)
 
 ## Unimplemented Features
 
 - Writing of the SPI Flash OTP region configuration (`sflash_otp lock/setregion`) - reason: OTP config writes are risky and can permanently brick devices
-- EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported by all devices
+- EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported on any device where a loader is present, likely a relic present only on older NationalChip devices
 - Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a Ethernet interface which can't be tested due to lack of supported hardware
-- Configuration loading (`load_conf_down`) - reason: Configuration loading is complex, will be implemented at a later stage
 - Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash, this option is also not supported by all devices
 
 ## Usage
@@ -123,6 +124,20 @@ To compare two files (host-side operation):
 ```bash
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "compare dump1.bin dump2.bin"
 ```
+
+To run a vendor-style config file after the bootloader is up, use `load_conf_down`.
+```bash
+cat > flash.conf <<'EOF'
+serialdown BOOT boot.bin
+flash erase LOGO
+EOF
+
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -t nns -c "load_conf_down flash.conf serialdown"
+```
+
+The `-t nns` mode is the vendor-style “do not send the .boot image again when the device is already in command mode” transfer mode.
+
+The vendor flasher also shows confirmation prompts for erase-style operations such as `flash erase` and `flash eraseall`. This implementation mirrors that behavior and supports `-y`/`--yes` to skip the prompt when desired.
 
 ## Protocol specifications
 

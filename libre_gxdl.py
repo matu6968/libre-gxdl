@@ -46,17 +46,37 @@ import os
 
 
 class GXUploader:
-    def __init__(self, device: str, baudrate: int = 115200, verbose: bool = False):
+    def __init__(self, device: str, baudrate: int = 115200, verbose: bool = False, skip_warnings: bool = False):
         self.verbose = verbose
         self.device = device
         self.baudrate = baudrate
         self.ser = None
         self.reset_dtr = False
         self.reset_rts = False
+        self.skip_warnings = skip_warnings
 
     def log(self, msg: str):
         if self.verbose:
             print(f"[*] {msg}")
+
+    def confirm_action(self, warning: str, prompt: str = "Continue?") -> bool:
+        """Prompt before running a potentially destructive erase command."""
+        if self.skip_warnings:
+            return True
+
+        print(f"[!] {warning}")
+        print(f"[!] {prompt} (y/N)")
+        try:
+            response = input().strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("[!] Aborted")
+            return False
+
+        if response in {"y", "yes"}:
+            return True
+
+        print("[!] Aborted")
+        return False
 
     def open(self):
         """Open serial port with exact settings matching vendor strace"""
@@ -148,7 +168,8 @@ class GXUploader:
         Known handshake patterns (all end with 0x58):
         - B0 B0 58 (3 bytes) - from sniffed data  
         - B8 B0 FF 58 (4 bytes) - alternate
-        - B0 30 FF 58 (4 bytes) - seen in some logs
+        - 00 B0 B0 58 (4 bytes) - seen in some logs
+        - B0 30 FF 58 (4 bytes) - alternative seen in some logs
         
         Detection: Look for 0x58 preceded by B0 or B8 prefix bytes
         
@@ -182,8 +203,8 @@ class GXUploader:
                         start_idx = max(0, i - 3)
                         candidate = buffer[start_idx:i+1]
                         
-                        # Valid if starts with B0 or B8
-                        if candidate[0] in (0xB0, 0xB8):
+                        # Valid if starts with 00, B0 or B8
+                        if candidate[0] in (0x00, 0xB0, 0xB8):
                             self.log(f"Handshake detected: {candidate.hex()}")
                             # Clear any remaining buffered data
                             time.sleep(0.005)
@@ -878,6 +899,103 @@ class GXUploader:
         print(buffer.decode('latin-1', errors='replace')[-500:])
         return False
 
+    def parse_config_file(self, config_file: str) -> list:
+        """
+        Parse a simple vendor-style config file into a list of commands.
+
+        The vendor loader expects a text file where each non-comment line is a
+        downloader command, with arguments split on whitespace. This parser is
+        intentionally lightweight and supports the common command forms used by
+        ``load_conf_down``: ``serialdown ...``, ``usbdown ...``, ``flash erase ...``
+        and similar one-line commands.
+        """
+        commands = []
+        try:
+            with open(config_file, "r", encoding="utf-8", errors="replace") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if parts:
+                        commands.append(parts)
+        except FileNotFoundError:
+            print(f"[!] Config file not found: {config_file}")
+            raise
+        except OSError as exc:
+            print(f"[!] Error reading config file: {exc}")
+            raise
+
+        return commands
+
+    def run_config_commands(self, config_file: str, transport: str | None = None, transport_path: str | None = None) -> bool:
+        """
+        Execute a config file as a sequence of downloader commands.
+
+        This mirrors the vendor loader's basic behavior for ``load_conf_down``:
+        it reads a text config file, parses each command line, and runs the
+        commands sequentially in the current bootloader session.
+        """
+        commands = self.parse_config_file(config_file)
+        if not commands:
+            print("[!] Config file contained no runnable commands")
+            return False
+
+        for parts in commands:
+            command = parts[0]
+            args = parts[1:]
+
+            if command == "serialdown":
+                if len(args) < 2:
+                    print(f"[!] Invalid serialdown entry in config: {' '.join(parts)}")
+                    return False
+                target, input_file = args[0], args[1]
+                if not self.serial_download(target, input_file):
+                    return False
+            elif command == "usbdown":
+                if len(args) < 2:
+                    print(f"[!] Invalid usbdown entry in config: {' '.join(parts)}")
+                    return False
+                target, filename = args[0], args[1]
+                if not self.usb_download(target, filename):
+                    return False
+            elif command == "serialdump":
+                if len(args) < 3:
+                    print(f"[!] Invalid serialdump entry in config: {' '.join(parts)}")
+                    return False
+                target, size, output_file = args[0], int(args[1]), args[2]
+                if not self.serial_dump(target, size, output_file):
+                    return False
+            elif command == "flash":
+                if len(args) < 1:
+                    print(f"[!] Invalid flash entry in config: {' '.join(parts)}")
+                    return False
+                if args[0] == "erase" and len(args) >= 2:
+                    nospread = args[1] == "nospread"
+                    args_start = 2 if nospread else 1
+                    if len(args) <= args_start:
+                        print(f"[!] Invalid flash erase entry in config: {' '.join(parts)}")
+                        return False
+                    target = args[args_start]
+                    length = int(args[args_start + 1]) if len(args) > args_start + 1 else None
+                    if not self.flash_erase(target, length, nospread):
+                        return False
+                elif args[0] == "badinfo":
+                    if not self.flash_badinfo():
+                        return False
+                elif args[0] == "eraseall":
+                    if not self.flash_eraseall():
+                        return False
+                else:
+                    print(f"[!] Unsupported flash command in config: {' '.join(parts)}")
+                    return False
+            else:
+                print(f"[!] Unsupported config command: {command}")
+                return False
+
+        print(f"[+] Executed {len(commands)} commands from {config_file}")
+        return True
+
     def text_command(self, command: str, timeout: float = 5.0) -> str:
         """
         Send a text command and capture the text response.
@@ -1495,6 +1613,9 @@ class GXUploader:
         
         print(f"[*] Flash erase: {command}")
         print("[!] WARNING: This will ERASE flash data!")
+
+        if not self.confirm_action(f"This will erase {target}. Are you sure?", "Proceed with flash erase?"):
+            return False
         
         result = self.text_command(command, timeout=120.0)
         
@@ -1538,6 +1659,9 @@ class GXUploader:
         
         print("[!] WARNING: flash eraseall will ERASE ALL FLASH DATA!")
         print("[!] This WILL BRICK the device if not immediately reflashed!")
+
+        if not self.confirm_action("This will erase the entire serial flash. Are you sure?", "Proceed with flash eraseall?"):
+            return False
         
         result = self.text_command("flash eraseall", timeout=300.0)
         
@@ -1546,7 +1670,7 @@ class GXUploader:
         
         return True
 
-    def run_command_mode(self, boot_file: str, command: str, cmd_args: list) -> bool:
+    def run_command_mode(self, boot_file: str, command: str, cmd_args: list, transfer_mode: str = "s") -> bool:
         """
         Boot device and run a command.
         
@@ -1554,27 +1678,46 @@ class GXUploader:
             boot_file: Boot file to upload first
             command: Command to run (serialdump, serialdown, etc.)
             cmd_args: Command arguments
+            transfer_mode: Transfer mode for the boot sequence; "s" sends the .boot image,
+                while "nns" skips boot image transfer when the device is already in command mode.
         
         Returns:
             True if successful
         """
-        # First, upload boot file
-        if not self.upload(boot_file):
-            print("[!] Failed to boot device")
+        if transfer_mode not in {"s", "nns"}:
+            print(f"[!] Unsupported transfer mode: {transfer_mode}")
             return False
-        
-        # Re-open serial port for command mode
-        self.open()
-        
-        # Wait a bit for boot to complete
-        time.sleep(0.5)
-        
-        # Clear any pending data and send newline to trigger fresh prompt
-        self.ser.reset_input_buffer()
-        self.ser.write(b"\n")
-        termios.tcdrain(self.ser.fileno())
-        time.sleep(0.1)
-        
+
+        if transfer_mode == "s":
+            if not self.upload(boot_file):
+                print("[!] Failed to boot device")
+                return False
+            self.open()
+            time.sleep(0.5)
+            if self.ser is not None:
+                self.ser.reset_input_buffer()
+                self.ser.write(b"\n")
+                try:
+                    termios.tcdrain(self.ser.fileno())
+                except (termios.error, OSError):
+                    pass
+                time.sleep(0.1)
+        else:
+            if not self.ser or not self.ser.is_open:
+                self.open()
+            if not self.wait_for_prompt(timeout=2.0):
+                print("[!] Not at boot> prompt; cannot use transfer mode nns")
+                return False
+
+            if self.ser is not None:
+                self.ser.reset_input_buffer()
+                self.ser.write(b"\n")
+                try:
+                    termios.tcdrain(self.ser.fileno())
+                except (termios.error, OSError):
+                    pass
+                time.sleep(0.1)
+
         # Handle the command
         if command == "serialdump":
             if len(cmd_args) < 3:
@@ -1695,6 +1838,24 @@ class GXUploader:
             target, filename = cmd_args[0], cmd_args[1]
             return self.usb_download(target, filename)
         
+        elif command == "load_conf_down":
+            if len(cmd_args) < 2:
+                print("[!] Usage: load_conf_down <config_file> <transport> [transport_path]")
+                return False
+            config_file = cmd_args[0]
+            transport = cmd_args[1]
+            transport_path = cmd_args[2] if len(cmd_args) > 2 else None
+            print(f"[*] Loading config via {transport}: {config_file}")
+            try:
+                if self.wait_for_prompt(timeout=2.0):
+                    return self.run_config_commands(config_file, transport, transport_path)
+            except FileNotFoundError:
+                return False
+            except OSError:
+                return False
+
+            return False
+        
         elif command == "flash":
             if len(cmd_args) < 1:
                 print("[!] Usage: flash <erase|badinfo|eraseall> [args...]")
@@ -1742,9 +1903,10 @@ class GXUploader:
             print("    flash                   - Flash management (erase, badinfo)")
             print("    compare                 - Compare two files (host-side)")
             return False
+        
 
 
-def main():
+def build_argument_parser():
     parser = argparse.ArgumentParser(
         description="libre-gxdl: Open Source GX Bootloader Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1808,22 +1970,29 @@ Commands:
   
   Utilities:
     compare <src_file> <dst_file>             - Compare two files (host-side)
+    load_conf_down <config_file> <transport> [transport_path] - Load config commands to device via transport (serial, usb, etc.)
   
 Tips:
   - Power cycle the device AFTER starting this tool
-  - Partitions: BOOT, TABLE, LOGO, KERNEL, ROOT, DATA
+  - Common partitions: BOOT, TABLE, LOGO, KERNEL, ROOT, DATA (may vary by device)
   - USB commands require USB storage connected to the device formatted as FAT32
         """
     )
     parser.add_argument("-b", "--boot", required=True, help="Boot file to upload")
     parser.add_argument("-d", "--device", required=True, help="Serial device (e.g., /dev/ttyUSB0)")
     parser.add_argument("-c", "--command", help="Bootloader command to execute after boot")
+    parser.add_argument("-t", "--transfer-mode", default="s", choices=["s", "nns"], help="Transfer mode for the bootloader upload: s (send boot image) or nns (skip boot image when already in command mode)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip destructive-operation confirmation prompts")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--reset-dtr", action="store_true", help="Pulse DTR to reset device")
     parser.add_argument("--reset-rts", action="store_true", help="Pulse RTS to reset device")
     parser.add_argument("--loopback-test", action="store_true", help="Test serial loopback (TX→RX)")
-    
+    return parser
+
+
+def main():
+    parser = build_argument_parser()
     args = parser.parse_args()
     
     if args.loopback_test:
@@ -1844,7 +2013,7 @@ Tips:
             print(f"    Got:  {response.hex() if response else 'nothing'}")
         sys.exit(0)
     
-    uploader = GXUploader(args.device, args.baud, args.verbose)
+    uploader = GXUploader(args.device, args.baud, args.verbose, skip_warnings=args.yes)
     
     # Set reset options
     uploader.reset_dtr = args.reset_dtr
@@ -1860,7 +2029,7 @@ Tips:
         cmd = parts[0]
         cmd_args = parts[1:]
         
-        success = uploader.run_command_mode(args.boot, cmd, cmd_args)
+        success = uploader.run_command_mode(args.boot, cmd, cmd_args, transfer_mode=args.transfer_mode)
     else:
         # Just boot the device
         success = uploader.upload(args.boot)
