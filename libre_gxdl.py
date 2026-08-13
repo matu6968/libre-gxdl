@@ -9,7 +9,7 @@ Supports GX/Nationalchip set-top boxes running eCos 3.x RTOS:
 - Sirius (GX6613)
 - Taurus (GX3113, GX3235, GX6605)
 - And more...
-Keep in mind that support is untested for other devices (only tested on GX6702) and may not work, so try at your own risk.
+Keep in mind that support is untested for other devices (only tested on GX6702 and GX6706) and may not work, so try at your own risk.
 
 Features:
 - Boot device via serial
@@ -43,6 +43,7 @@ import sys
 import time
 import termios
 import os
+import re
 
 
 class GXUploader:
@@ -286,62 +287,104 @@ class GXUploader:
         Vendor timing: ~736ms after Stage 1 complete
         """
         self.log("Waiting for RUNGET response (up to 15s)...")
-        
+
         buffer = bytearray()
         start_time = time.time()
         got_run = False
         got_get = False
         last_rx_time = start_time
-        
+
+        # Tolerant detection: prefer contiguous "RUN" and "GET" tokens,
+        # but allow short non-alphanumeric separators (punctuation/newlines).
+        # Avoid matching long alphabetic noise like "19RUkgd:3\r\nNGET".
+        # Match R U N G E T with up to 4 non-alphanumeric chars between.
+        runget_re = re.compile(rb"R[^A-Za-z0-9]{0,4}U[^A-Za-z0-9]{0,4}N[^A-Za-z0-9]{0,4}G[^A-Za-z0-9]{0,4}E[^A-Za-z0-9]{0,4}T", re.IGNORECASE | re.DOTALL)
+
+        # Precompile token-boundary regexes for RUN and GET to avoid matching
+        # these letter sequences when they're part of other words (like NGET).
+        run_token_re = re.compile(rb"(^|[^A-Za-z0-9])RUN([^A-Za-z0-9]|$)")
+        get_token_re = re.compile(rb"(^|[^A-Za-z0-9])GET([^A-Za-z0-9]|$)")
+
         while time.time() - start_time < timeout:
             # Read all available data
             if self.ser.in_waiting:
                 data = self.ser.read(self.ser.in_waiting)
                 buffer.extend(data)
                 last_rx_time = time.time()
-                
+
                 if self.verbose:
                     for b in data:
                         ch = chr(b) if 32 <= b < 127 else '.'
                         print(f"    Rx: 0x{b:02X} '{ch}'")
-                
-                # Check for RUN
-                if b"RUN" in buffer and not got_run:
+
+                # Check for RUN / GET as standalone tokens (not embedded)
+                if not got_run and run_token_re.search(buffer):
                     print("[*] Received RUN")
                     got_run = True
-                
-                # Check for GET
-                if b"GET" in buffer and not got_get:
+
+                if not got_get and get_token_re.search(buffer):
                     print("[*] Received GET")
                     got_get = True
-                
-                # If we have both, we're done
+
                 if got_run and got_get:
                     return True
-                
-                # Also accept just "RUN" followed by silence (some devices)
+
+                # Accept RUN followed by short silence as success
                 if got_run and (time.time() - last_rx_time) > 1.0:
                     print("[*] Got RUN, proceeding without explicit GET")
                     return True
+
+                # Fallback: tolerant regex-based RUNGET detection
+                if runget_re.search(buffer):
+                    print("[*] Detected RUNGET variant (tolerant match)")
+                    return True
+
+                # Ordered-subsequence detection: allow RUNGET letters to appear
+                # in order with small arbitrary bytes between (handles cases
+                # like '19RUkgd:3\r\nNGET' where 'RU' and the 'N' are split).
+                def ordered_subsequence(buf: bytes, pattern: bytes, max_gap: int = 25) -> bool:
+                    idx = 0
+                    last_pos = -1
+                    for ch in pattern:
+                        found = False
+                        # search starting after last_pos
+                        start = last_pos + 1
+                        while start < len(buf):
+                            if bytes([buf[start]]).lower() == bytes([ch]).lower():
+                                # check gap
+                                if last_pos == -1 or (start - last_pos) <= max_gap:
+                                    last_pos = start
+                                    found = True
+                                    break
+                                else:
+                                    return False
+                            start += 1
+                        if not found:
+                            return False
+                    return True
+
+                if ordered_subsequence(buffer, b"RUNGET", max_gap=40):
+                    print("[*] Detected RUNGET variant (ordered subsequence)")
+                    return True
             else:
                 time.sleep(0.005)
-        
+
         # Print what we got for debugging
         elapsed = time.time() - start_time
         if buffer:
             try:
                 text = buffer.decode('latin-1')
                 print(f"[!] Timeout after {elapsed:.1f}s waiting for RUNGET")
-                print(f"[!] Got {len(buffer)} bytes: {repr(text[:100])}")
-            except:
-                print(f"[!] Timeout after {elapsed:.1f}s. Got: {buffer[:100].hex()}")
+                print(f"[!] Got {len(buffer)} bytes: {repr(text[:200])}")
+            except Exception:
+                print(f"[!] Timeout after {elapsed:.1f}s. Got: {buffer[:200].hex()}")
         else:
             print(f"[!] Timeout after {elapsed:.1f}s - no data received from device")
             print("[!] Possible causes:")
             print("    - Stage 1 data was corrupted in transmission")
             print("    - Device is in wrong state (try power cycle)")
             print("    - Serial TX line issue (check wiring)")
-        
+
         return False
 
     def send_stage2(self, boot_data: bytes) -> bool:
@@ -372,8 +415,22 @@ class GXUploader:
         self.log(f"  Boot content checksum: 0x{checksum16:04X}")
         
         # Build metadata parts (NO "boot" magic - that was sent in Stage 1!)
-        # Part 1: checksum16 + field2 (0x00C2)
-        meta_part1 = struct.pack("<H", checksum16) + struct.pack("<H", 0x00C2)
+        # Choose metadata field based on boot file chip ID so we keep
+        # backward compatibility with older devices (GX6702) while
+        # matching vendor behaviour for GX6706 and similar IPLs.
+        try:
+            chip_id = struct.unpack("<H", boot_data[6:8])[0]
+        except Exception:
+            chip_id = None
+
+        # Default metadata field (observed for many devices / older GX6702 builds)
+        metadata_field = 0x00C2
+        # Vendor observed 0x00C5 for GX6706 IPLs; switch when chip matches
+        if chip_id in (0x6706, 0x6706):
+            metadata_field = 0x00C5
+
+        self.log(f"  Detected chip id: 0x{chip_id:04X} -> using metadata field 0x{metadata_field:04X}")
+        meta_part1 = struct.pack("<H", checksum16) + struct.pack("<H", metadata_field)
         # Part 2: boot_size
         meta_part2 = struct.pack("<I", boot_size)
         

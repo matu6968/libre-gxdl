@@ -103,6 +103,15 @@ checksum16 = sum(boot_content) & 0xFFFF
 
 Device outputs partition table and system information, ending with `boot>` prompt.
 
+### Note on Metadata Field Variations
+
+Some vendor IPLs use a different 2-byte "type/flags" value in the Stage 2 wrapper. This field is chosen by the vendor downloader based on the target chip/board. In our testing:
+
+- `0x00C2` — Default value observed for older Gemini/GX6702 style boot files (keeps backward compatibility)
+- `0x00C5` — Observed in vendor captures for GX6706 IPLs; using `0x00C2` against those IPLs can produce an early `E` (error) response.
+
+The `libre_gxdl.py` uploader automatically selects the correct metadata field by reading the `Chip ID` in the `.boot` header (offset 0x06). If you need to override this behaviour, modify the uploader source accordingly.
+
 ## Boot File Format
 
 The `.boot` file has a specific structure:
@@ -348,13 +357,13 @@ sflash_otp erase
 ```
 Text-mode command; response is textual.
 
-### Available Partitions
+### Available Partitions (will differ by device)
 
 | ID | Name | Address | Size | Description |
 |----|------|---------|------|-------------|
-| 0 | BOOT | 0x000000 | 64 KB | GxLoader bootloader |
+| 0 | BOOT | 0x000000 | 64 KB | IPL (8 KB) and GxLoader bootloader (56 KB) |
 | 1 | TABLE | 0x010000 | 512 B | Partition table |
-| 2 | LOGO | 0x010200 | 65024 B | Boot logo (JPEG/PNG) |
+| 2 | LOGO | 0x010200 | 65024 B | Boot logo (JPEG, decoded by hardware JPEG decoder on device) |
 | 3 | KERNEL | 0x020000 | 2688 KB | eCos 3.x RTOS kernel + embedded romfs |
 | 4 | ROOT | 0x2c0000 | 832 KB | Root filesystem (cramfs) |
 | 5 | DATA | 0x390000 | 448 KB | User data partition (minifs)
@@ -362,9 +371,13 @@ Text-mode command; response is textual.
 **Note:** These devices typically run eCos 3.x RTOS due to low flash sizes (typically 4MB). The kernel includes statically 
 linked utilities like SDL 2 (UI), ntfs-3g (NTFS driver for USB storage), WiFi/Ethernet firmware, etc from analysis of the KERNEL partition.
 
+Additionally some devices may come with a 64 KB `BOOT` partition while others with 128 KB `BOOT` partitions, the main difference
+between then is the support for USB firmware upgrades by loading one of `recovery.rcv`, `recovery_all.rcv`, `recovery_all_force.rcv` (or by the chipset name for example `gx6706.rcv` or `gx6706_all.rcv`) files on
+a FAT32 USB drive and booting the setup box with it which will replace the entire firmware stored on flash.
+
 ## Notes
 
-1. The handshake pattern may vary (`B0 B0 58`, `B0 30 FF 58`, or `B8 B0 FF 58`)
+1. The handshake pattern may vary (`B0 B0 58`, `B0 30 FF 58`, `00 B0 B0 58` or `B8 B0 FF 58`)
 2. Some devices require DTR/RTS reset pulse to enter bootloader mode
 3. The protocol has no error recovery - if a stage fails, restart from beginning
 4. All multi-byte values are little-endian

@@ -4,7 +4,7 @@ This is an open source reimplementation of the GX series downloader (also known 
 
 ## Features
 
-- Supports GX series devices (tested on GX6702, others may work but use caution)
+- Supports GX series devices (tested on GX6702 and GX6706, others may work but use caution)
 - Boot device via serial
 - Read/write flash partitions via serial (`serialdump`/`serialdown`)
 - Read/write flash partitions via USB drive attached to device (`usbdump`/`usbdown`)
@@ -55,6 +55,22 @@ board type	: generic
 memory size	: 64 MB
 Flash type	: mx25l32
 Flash size	: 4 MB
+```
+
+or the chipset name can be a codename:
+
+```
+GxLoader SDK_V2.5.0_RC6 sdk_dev (966f4738717d5e7bd738d238495eb8139ad4c967) Thu Dec 21 10:39:46 CST 2023 
+
+public id       : 8909b32d050776ae
+cpu family      : CSKY
+chip model      : cygnus 
+board type      : Cygnus-X5 <-- This is the key value to determine which boot file to use
+memory size     : 64 MB
+Flash type      : XM25QH32B/XM25QH32C/XM25QE32C
+Flash size      : 4 MB
+cpu freq        : 672 MHz
+memory freq     : 672 MHz 
 ```
 To specify the bootloader file, use the `-b` argument.
 
