@@ -23,11 +23,11 @@ Protocol Summary:
 1. Device sends handshake: B0 B0 58 (ACK sequence)
 2. Host sends Stage 1:
    - 5-byte header: [0x59][len_lo][len_hi][addr_lo][addr_hi]
-   - 8188 bytes payload from boot file offset 0x20 (includes checksum)
-   - "boot" terminator
+   - Chip-dependent initial payload from boot file offset 0x20
+   - "boot" stage-transition marker
 3. Device responds: "RUNGET"
 4. Host sends Stage 2:
-   - 8-byte metadata: checksum16 + 0x00C2 + size32
+   - 12-byte wrapper: "boot" + checksum32 + size32
    - Boot content in 2048-byte chunks
 5. Device boots and shows partition info
 
@@ -231,47 +231,27 @@ class GXUploader:
         
         Format:
         - Header (5 bytes): [0x59][len_lo][len_hi][addr_lo][addr_hi]
-        - Payload (8184 bytes): boot_data[0x20:0x2018]
-        - Checksum (4 bytes): boot_data[0x2018:0x201C] (embedded in file)
-        
-        The length field is (payload_size >> 2) in little-endian, meaning
-        0x0800 = 2048 words = 8192 bytes (but we send 8184 + 4 checksum = 8188)
+        - Payload: selected from the boot file according to its chip ID
+        - "boot" stage-transition marker
+
+        The vendor uses a 0x2000-byte initial layout for 0x6616, 0x3211,
+        0x6701, and 0x6705; a 0x4000-byte layout for 0x6612; and a
+        0x1000-byte layout for other chip IDs.
         
         IMPORTANT: Must send quickly after handshake - device has short timeout!
         """
         self.log("Sending Stage 1 (must be fast!)...")
         
-        # Extract payload and embedded checksum from boot file
-        payload_start = 0x20
-        payload_end = 0x2018
-        checksum_end = 0x201C
-        
-        payload = boot_data[payload_start:payload_end]
-        checksum = boot_data[payload_end:checksum_end]
-        
-        # Build header: 0x59 followed by length (in 4-byte words) and address
-        # Length field: 0x0800 = 2048 words = 8192 bytes
-        length_field = 0x0800  # This seems to be fixed
-        addr_field = 0x0000    # First block
-        
-        header = bytes([
-            0x59,
-            length_field & 0xFF,
-            (length_field >> 8) & 0xFF,
-            addr_field & 0xFF,
-            (addr_field >> 8) & 0xFF,
-        ])
-        
-        # Build complete packet and send in ONE write for speed
-        packet = header + payload + checksum
+        header, payload, marker = self._build_stage1_parts(boot_data)
+        packet = header + payload + marker
         
         # Send entire packet at once
         bytes_written = self.ser.write(packet)
         self.ser.flush()
         
         self.log(f"  Header: {header.hex()}")
-        self.log(f"  Payload: {len(payload)} bytes from boot[0x{payload_start:X}:0x{payload_end:X}]")
-        self.log(f"  Checksum: {checksum.hex()} (embedded in boot file)")
+        self.log(f"  Payload: {len(payload)} bytes")
+        self.log(f"  Stage marker: {marker!r}")
         self.log(f"  Total Stage 1: {bytes_written} bytes sent")
         
         return bytes_written == len(packet)
@@ -387,52 +367,40 @@ class GXUploader:
 
         return False
 
+    @staticmethod
+    def _build_stage2_parts(boot_data: bytes) -> tuple:
+        """Build the vendor Stage 2 wrapper and transformed payload."""
+        boot_size = len(boot_data)
+        boot_content = boot_data[0:4] + boot_data[0x20:]
+        if len(boot_content) < boot_size:
+            boot_content += bytes(boot_size - len(boot_content))
+
+        checksum32 = sum(boot_content) & 0xFFFFFFFF
+        return (
+            b"boot",
+            struct.pack("<I", checksum32),
+            struct.pack("<I", boot_size),
+            boot_content,
+        )
+
     def send_stage2(self, boot_data: bytes) -> bool:
         """
-        Send Stage 2 based on strace of vendor tool:
-        
-        Metadata (8 bytes in two 4-byte writes):
-        - Part 1: checksum16 (2B LE) + field2 (2B LE) = 0x00C2
-        - Part 2: boot_size (4B LE)
-        
-        Payload: Full boot file content in 2048-byte chunks
-        - Starts with "toob" magic
-        - Then code from boot[0x20:]
+        Send Stage 2 using the vendor's wire format:
+
+        - Continuation: 4-byte little-endian additive checksum of the payload
+        - 4-byte little-endian payload size
+        - Full boot content in 2048-byte chunks
+
+        The ASCII "boot" marker is sent after the Stage 1 payload, before
+        RUNGET. The apparent 0x00C2/0x00C5 type values are the upper half of
+        the 32-bit checksum, not an independent SoC-specific field.
         """
         self.log("Sending Stage 2...")
         
+        _magic, meta_part1, meta_part2, boot_content = self._build_stage2_parts(boot_data)
         boot_size = len(boot_data)
-        
-        # Build boot content: "toob" + code (skip header bytes 4-31)
-        boot_content = boot_data[0:4] + boot_data[0x20:]  # "toob" + code
-        
-        # Pad to original size with zeros if needed
-        if len(boot_content) < boot_size:
-            boot_content += bytes(boot_size - len(boot_content))
-        
-        # Calculate 16-bit checksum of boot content
-        checksum16 = sum(boot_content) & 0xFFFF
-        self.log(f"  Boot content checksum: 0x{checksum16:04X}")
-        
-        # Build metadata parts (NO "boot" magic - that was sent in Stage 1!)
-        # Choose metadata field based on boot file chip ID so we keep
-        # backward compatibility with older devices (GX6702) while
-        # matching vendor behaviour for GX6706 and similar IPLs.
-        try:
-            chip_id = struct.unpack("<H", boot_data[6:8])[0]
-        except Exception:
-            chip_id = None
-
-        # Default metadata field (observed for many devices / older GX6702 builds)
-        metadata_field = 0x00C2
-        # Vendor observed 0x00C5 for GX6706 IPLs; switch when chip matches
-        if chip_id in (0x6706, 0x6706):
-            metadata_field = 0x00C5
-
-        self.log(f"  Detected chip id: 0x{chip_id:04X} -> using metadata field 0x{metadata_field:04X}")
-        meta_part1 = struct.pack("<H", checksum16) + struct.pack("<H", metadata_field)
-        # Part 2: boot_size
-        meta_part2 = struct.pack("<I", boot_size)
+        checksum32 = struct.unpack("<I", meta_part1)[0]
+        self.log(f"  Boot content checksum: 0x{checksum32:08X}")
         
         self.log(f"  Metadata part 1: {meta_part1.hex()}")
         self.log(f"  Metadata part 2: {meta_part2.hex()}")
@@ -513,7 +481,7 @@ class GXUploader:
         print(f"    Version: 0x{version:04X}, Chip: 0x{chip:04X}, Baud: {baud}")
         
         # Pre-build Stage 1 parts based on strace analysis
-        header, payload, terminator = self._build_stage1_parts(boot_data)
+        header, payload, marker = self._build_stage1_parts(boot_data)
         
         try:
             self.open()
@@ -526,7 +494,7 @@ class GXUploader:
                 return False
             
             # Step 2: Send Stage 1 (matching vendor strace exactly!)
-            # Vendor sends: header(5) + payload(8188) + "boot"(4) = 8197 bytes
+            # Vendor sends: header(5) + chip-dependent payload + boot marker
             self.log("Sending Stage 1...")
             
             # Flush buffers before sending (like vendor does)
@@ -537,18 +505,19 @@ class GXUploader:
             self.ser.write(header)
             self.log(f"  Header: {header.hex()}")
             
-            # Send payload (8188 bytes) - same write as vendor
+            # Send payload - same write as vendor
             self.ser.write(payload)
             self.log(f"  Payload: {len(payload)} bytes")
-            
-            # Send "boot" terminator (4 bytes)
-            self.ser.write(terminator)
-            self.log(f"  Terminator: {terminator}")
+
+            # The vendor sends this marker before waiting for RUNGET. It is
+            # not sent again with the Stage 2 continuation.
+            self.ser.write(marker)
+            self.log(f"  Stage marker: {marker}")
             
             # Drain output buffer to ensure physical transmission (like vendor)
             termios.tcdrain(fd)
             
-            total_sent = len(header) + len(payload) + len(terminator)
+            total_sent = len(header) + len(payload) + len(marker)
             self.log(f"  Total Stage 1: {total_sent} bytes")
             
             # Step 3: Wait for RUNGET
@@ -582,16 +551,30 @@ class GXUploader:
     
     def _build_stage1_parts(self, boot_data: bytes) -> tuple:
         """
-        Build Stage 1 parts based on strace of vendor tool:
-        1. Header (5 bytes): 59 00 08 00 00
-        2. Payload (8188 bytes): boot_data[0x20:0x201C] - includes checksum!
-        3. "boot" terminator (4 bytes)
+        Build Stage 1 parts using the vendor's chip-dependent layout.
+
+        The length field is the initial transfer size in 32-bit words. The
+        payload excludes the 0x20-byte boot header; for the 0x6612 path the
+        vendor transfers 0x3fe0 bytes, while the other paths transfer the
+        initial layout minus four bytes. The ``boot`` marker transitions the
+        device into the Stage 2 continuation and is sent after this payload.
         """
-        header = bytes([0x59, 0x00, 0x08, 0x00, 0x00])
-        payload = boot_data[0x20:0x201C]  # 8188 bytes (includes checksum)
-        terminator = b"boot"
-        
-        return header, payload, terminator
+        if len(boot_data) < 8:
+            raise ValueError("boot data is too short to contain a chip ID")
+
+        chip_id = struct.unpack("<H", boot_data[6:8])[0]
+        if chip_id == 0x6612:
+            transfer_size = 0x4000
+            payload = boot_data[0x20:transfer_size]
+        elif chip_id in (0x6616, 0x3211, 0x6701, 0x6705):
+            transfer_size = 0x2000
+            payload = boot_data[0x20:0x20 + transfer_size - 4]
+        else:
+            transfer_size = 0x1000
+            payload = boot_data[0x20:0x20 + transfer_size - 4]
+
+        header = struct.pack("<BHH", 0x59, transfer_size >> 2, 0x0000)
+        return header, payload, b"boot"
 
     def wait_for_prompt(self, timeout: float = 5.0) -> bool:
         """
@@ -2096,4 +2079,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

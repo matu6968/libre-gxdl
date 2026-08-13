@@ -33,15 +33,15 @@ Additionally, call `tcflush(fd, TCIOFLUSH)` before sending and `tcdrain(fd)` aft
 │   Host   │                          │  Device  │
 └────┬─────┘                          └────┬─────┘
      │                                     │
-     │  <───── B8 B0 FF 58 ───────────   │  Handshake (device ready)
+     │  <───── B8 B0 FF 58 ───────────     │  Handshake (device ready)
      │                                     │
-     │  ────── Stage 1 (8197 bytes) ──>   │  Header + Payload + "boot" terminator
+     │  ────────── Stage 1 ──────────>     │  Header + payload + "boot" marker
      │                                     │
-     │  <─────────── RUNGET ──────────   │  Device ready for stage 2
+     │  <─────────── RUNGET ──────────     │  Device ready for stage 2
      │                                     │
-     │  ────────── Stage 2 ──────────>    │  Metadata + boot content
+     │  ────────── Stage 2 ──────────>     │  "boot" + checksum32 + size32 + content
      │                                     │
-     │  <───── Boot Output (text) ─────   │  Partition info, device info, boot>
+     │  <───── Boot Output (text) ────     │  Partition info, device info, boot>
      │                                     │
 ```
 
@@ -49,20 +49,25 @@ Additionally, call `tcflush(fd, TCIOFLUSH)` before sending and `tcdrain(fd)` aft
 
 **Purpose**: Sends the initial bootstrap code to RAM
 
-### Packet Format (8197 bytes total)
+### Packet Format
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 1 | Command | `0x59` (Download command) |
-| 1-2 | 2 | Length | `0x0800` LE (2048 words) |
+| 1-2 | 2 | Length | Initial transfer size in 32-bit words |
 | 3-4 | 2 | Address | `0x0000` (First block) |
-| 5-8192 | 8188 | Payload | Boot file bytes `[0x20:0x201C]` |
-| 8193-8196 | 4 | Terminator | ASCII `"boot"` |
+| 5... | variable | Payload | Chip-dependent boot file bytes |
+| ... | 4 | Marker | ASCII `"boot"` |
 
 **Key Points**:
-- Payload is `boot_data[0x20:0x201C]` = 8188 bytes (includes embedded checksum)
-- The `"boot"` terminator is REQUIRED and must be sent after the payload
-- Total: 5 (header) + 8188 (payload) + 4 (terminator) = 8197 bytes
+- For chip IDs `0x6616`, `0x3211`, `0x6701`, and `0x6705`, the length is
+  `0x0800` and the payload is 8188 bytes (`boot_data[0x20:0x201C]`).
+- For chip ID `0x6612`, the length is `0x1000` and the payload is 0x3fe0
+  bytes (`boot_data[0x20:0x4000]`).
+- Other chip IDs use length `0x0400` and a 4092-byte payload
+  (`boot_data[0x20:0x101C]`).
+- The `"boot"` marker is sent after the Stage 1 payload, before waiting for
+  `RUNGET`; the checksum32, size32, and payload follow `RUNGET`.
 
 ### Response
 
@@ -74,14 +79,17 @@ Device responds with handshake (e.g., `B8 B0 FF 58`) before Stage 1, then `RUNGE
 
 ### Packet Format (148040 bytes for a 148028-byte boot file)
 
-#### Wrapper (12 bytes)
+#### Combined wrapper (12 bytes)
 
-| Offset | Size | Field | Value | Description |
-|--------|------|-------|-------|-------------|
-| 0-3 | 4 | Magic | `"boot"` | Transfer marker |
-| 4-5 | 2 | Checksum | 16-bit sum | Sum of boot content (mod 0x10000) |
-| 6-7 | 2 | Type | `0x00C2` | Type/flags (194 decimal) |
-| 8-11 | 4 | Size | Boot file size | Little-endian |
+The `boot` marker is sent at the end of Stage 1. After the device responds
+with `RUNGET`, the host sends the remaining eight wrapper bytes followed by
+the boot content:
+
+| Combined offset | Size | Field | Description |
+|----------------|------|-------|-------------|
+| 4-7 | 4 | Checksum | 32-bit additive sum of boot content |
+| 8-11 | 4 | Size | Boot file size, little-endian |
+| 12... | variable | Content | Transformed boot content |
 
 #### Boot Content (boot_size bytes)
 
@@ -96,21 +104,20 @@ Sent:      [toob][code from 0x20...][28 bytes zero padding]
 ```python
 boot_content = boot_data[0:4] + boot_data[0x20:]  # "toob" + code
 boot_content += bytes(boot_size - len(boot_content))  # Pad to original size
-checksum16 = sum(boot_content) & 0xFFFF
+checksum32 = sum(boot_content) & 0xFFFFFFFF
 ```
 
 ### Response
 
 Device outputs partition table and system information, ending with `boot>` prompt.
 
-### Note on Metadata Field Variations
+### Note on Apparent Metadata Field Variations
 
-Some vendor IPLs use a different 2-byte "type/flags" value in the Stage 2 wrapper. This field is chosen by the vendor downloader based on the target chip/board. In our testing:
-
-- `0x00C2` — Default value observed for older Gemini/GX6702 style boot files (keeps backward compatibility)
-- `0x00C5` — Observed in vendor captures for GX6706 IPLs; using `0x00C2` against those IPLs can produce an early `E` (error) response.
-
-The `libre_gxdl.py` uploader automatically selects the correct metadata field by reading the `Chip ID` in the `.boot` header (offset 0x06). If you need to override this behaviour, modify the uploader source accordingly.
+The four bytes after `"boot"` are one 32-bit little-endian checksum, not a
+16-bit checksum followed by an independent type/flags field. For example,
+the captured bytes `1B 34 C2 00` represent checksum `0x00C2341B`; `0x00C2`
+is merely the checksum's upper 16 bits. It varies with the complete boot
+payload and is not selected by SoC.
 
 ## Boot File Format
 
@@ -382,15 +389,40 @@ a FAT32 USB drive and booting the setup box with it which will replace the entir
 3. The protocol has no error recovery - if a stage fails, restart from beginning
 4. All multi-byte values are little-endian
 5. **Critical**: The INPCK termios flag MUST be set for reliable communication
-6. The `"boot"` terminator after Stage 1 payload is **required** - without it the device won't respond
+6. The ASCII `"boot"` marker must be sent after the Stage 1 payload, before
+   waiting for `RUNGET`.
+
+### IPL noise and tolerant synchronization
+
+The IPL may emit diagnostic bytes around both synchronization responses. The
+host must not require the handshake to arrive as one contiguous read or assume
+that all bytes before it are meaningful. A handshake is recognized when a
+`0x58` terminator has at least two preceding bytes and the candidate sequence's
+first byte is `0x00`, `0xB0`, or `0xB8`; this accepts the observed forms even
+when they are split across reads. Once detected, discard buffered IPL output
+before sending Stage 1 and respond immediately.
+
+`RUNGET` detection is similarly tolerant. Accept, in order:
+
+- contiguous `RUNGET` (case-insensitive);
+- standalone `RUN` and `GET` tokens separated by non-alphanumeric bytes;
+- `R`, `U`, `N`, `G`, `E`, `T` with at most four non-alphanumeric bytes between
+  adjacent letters; and
+- the letters in order with no more than 40 received bytes between adjacent
+  letters, for captures polluted by IPL text (for example
+  `19RUkgd:3\r\nNGET`).
+
+Do not treat arbitrary occurrences embedded in longer alphanumeric words as
+standalone tokens. If `RUN` is received without `GET`, a short silence may be
+treated as success for devices that omit the second token.
 
 ## Troubleshooting
 
 If the device doesn't respond with RUNGET after Stage 1:
 
 1. **Check termios settings**: INPCK flag must be set
-2. **Check payload size**: Must be 8188 bytes (`boot_data[0x20:0x201C]`)
-3. **Check terminator**: `"boot"` must be sent after payload
+2. **Check payload size**: It must match the chip-dependent Stage 1 layout above
+3. **Check Stage 2 marker**: `"boot"` must follow the Stage 1 payload before
+   waiting for `RUNGET`
 4. **Check timing**: Don't add unnecessary delays between writes
 5. **Verify handshake**: Wait for the 0x58 byte before sending
-
