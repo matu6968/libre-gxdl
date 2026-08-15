@@ -36,4 +36,5 @@ below.
         boot.elf (proprietary, (c) NationalChip)
         boot.exe (proprietary, (c) NationalChip)
     /loaders
+        u-boot-gx6702.boot (GPLv2, source: https://github.com/linux-goxceed/u-boot/tree/v2026.07-csky)
         * (proprietary, (c) NationalChip)

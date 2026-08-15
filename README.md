@@ -24,7 +24,9 @@ This is an open source reimplementation of the GX series downloader (also known 
 
 ## Usage
 
-To use this tool, non-free bootloader files are required to boot the device. This might be reverse engineered at some point to remove the blobs all together for a entire open source solution.
+To use this tool, non-free bootloader files are required to boot the device. 
+
+If you are using a GX6702 then U-Boot is available which is the only open-source bootloader available here but it does not support existing GxLoader commands, for other devices but GX6702 this might be reverse engineered at some point to remove the blobs all together for a entire open source solution.
 
 For convinience purposes, we provide the bootloader files (extracted from the gxdownloader_boot utilities) in the `loaders` directory.
 
