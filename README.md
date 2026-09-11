@@ -7,22 +7,36 @@ This is an open source reimplementation of the GX series downloader (also known 
 - Supports GX series devices (tested on GX6702 and GX6706, others may work but use caution)
 - Boot device via serial
 - Read/write flash partitions via serial (`serialdump`/`serialdown`)
+- Read/write flash partitions via Ethernet TFTP (`netdump`/`netdown`, UDP port 2000)
 - Read/write flash partitions via USB drive attached to device (`usbdump`/`usbdown`)
 - Read/write GX OTP memory (`gx_otp read`/`tread`/`write`/`twrite`) **DANGEROUS**
-- Read/erase/write SPI Flash OTP (`sflash_otp status`/`getregion`/`read`/`write`/`erase`) **DANGEROUS**
-- Flash management (`flash erase`/`badinfo`/`eraseall`)
+- Read/erase/write/lock SPI Flash OTP (`sflash_otp status`/`getregion`/`read`/`write`/`erase`/`lock`/`setregion`) **DANGEROUS**
+- Flash management (`flash erase`/`badinfo`/`eraseall`/`scrub`/`mark bad`) **scrub/mark are NAND and untested**
 - Configuration loading via `load_conf_down` using vendor-style config files
 - Transfer mode support for `-t nns` to skip boot-image transfer when already in command mode
 - File comparison (`compare`)
 
 ## Unimplemented Features
 
-- Writing of the SPI Flash OTP region configuration (`sflash_otp lock/setregion`) - reason: OTP config writes are risky and can permanently brick devices
 - EEPROM reading/writing (`eeprom read`/`write`) - reason: EEPROM reading/writing is not supported on any device where a loader is present, likely a relic present only on older NationalChip devices
-- Network transfer commands (`netdown`/`netdump`) - reason: Network transfer requires a device with a Ethernet interface which can't be tested due to lack of supported hardware
-- Flash scrub/mark bad commands (dangerous, intentionally not implemented) - reason: Flash scrub/mark bad commands are dangerous and can mess up the SPI flash, this option is also not supported by all devices
 
 ## Usage
+
+To install the tool to your Python installation, run the following command:
+```bash
+pip install git+https://github.com/matu6968/libre-gxdl.git
+```
+
+or from a direct Git repository clone:
+```bash
+git clone https://github.com/matu6968/libre-gxdl.git
+cd libre-gxdl
+# pip install is optional if you want to use it as is in this directory
+# just install the dependencies in requirements.txt
+pip install .
+```
+
+This will let you use tool using `libre-gxdl` as the command name, additionally this will automatically resolve any loaders in the `loaders` directory to the correct path, for example `gemini-6702H5-sflash-24M.boot` will be resolved to `<data-root>/share/loaders/gemini-6702H5-sflash-24M.boot`.
 
 To use this tool, non-free bootloader files are required to boot the device. 
 
@@ -80,6 +94,12 @@ To specify the bootloader file, use the `-b` argument.
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0
 ```
 
+On Windows, use the COM port from Device Manager -> Ports (COM & LPT), for example `-d COM3`. Close any other program using that port first (PuTTY, Tera Term, tio). `COM10` and higher, and some USB UART drivers, need the `\\.\COM3` device path; libre-gxdl rewrites `COM3` to that form automatically. If open still fails with "No such file or directory", the name is wrong or unused - the error output lists ports Python can see.
+
+```powershell
+py libre_gxdl.py -b loaders\cygnus-cygnus-X5-sflash-24M.boot -d COM3
+```
+
 To dump the flash partition to a file, use the `serialdump` command.
 ```bash
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "serialdump BOOT 65536 dump.bin"
@@ -118,6 +138,10 @@ python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c
 
 # Erase SPI Flash OTP region (device-defined scope)
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp erase"
+
+# Lock SPI Flash OTP / select region (DANGEROUS, irreversible on some parts; untested)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp lock"
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "sflash_otp setregion 0"
 ```
 
 To dump/write flash via USB drive attached to device:
@@ -136,6 +160,28 @@ python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c
 
 # Erase a partition
 python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash erase LOGO"
+
+# NAND scrub / mark-bad (DANGEROUS; vendor passthrough, untested; often absent on SPI NOR)
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash scrub 0x0 0x20000"
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash scrub all"
+python libre_gxdl.py -b loaders/gemini-6702H5-sflash-24M.boot -d /dev/ttyUSB0 -c "flash mark bad 0x20000"
+```
+
+To dump/write flash over Ethernet TFTP, use a **direct** PC↔device cable (Wi-Fi
+paths often ARP then drop UDP). Point `-p` at the PC NIC on that link and `-s`
+at the board. GxLoader TFTP is UDP **2000**, not 69. See [PROTOCOL.md](PROTOCOL.md)
+for the WRQ/RRQ quirks (no OACK on dump; no empty last DATA packet).
+
+```bash
+# Dump DATA (size from the on-flash TABLE; 0x140000 on a 4 MB 6706H5)
+python libre_gxdl.py -b loaders/cygnus-6706H5-sflash-24M.boot -d /dev/ttyUSB0 -t nns \
+  -p 192.168.120.100 -s 192.168.120.3 \
+  -c "netdump DATA 0x140000 data-ref.bin"
+
+# Write DATA back (DANGEROUS — erases and programs the partition)
+python libre_gxdl.py -b loaders/cygnus-6706H5-sflash-24M.boot -d /dev/ttyUSB0 -t nns \
+  -p 192.168.120.100 -s 192.168.120.3 -y \
+  -c "netdown DATA data-ref.bin"
 ```
 
 To compare two files (host-side operation):

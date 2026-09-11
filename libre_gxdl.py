@@ -38,23 +38,471 @@ Usage:
 import argparse
 import binascii
 import serial
+import socket
 import struct
 import sys
+import sysconfig
+import site
+import threading
 import time
-import termios
 import os
 import re
+from importlib.metadata import PackageNotFoundError, files as distribution_files
+from pathlib import Path
+
+try:
+    import termios
+except ImportError:
+    termios = None
+
+GXID_RE = re.compile(rb"GXID family=([a-z0-9]+) name=(\S+)")
+GXBC_MAGIC = 0x43425847
+GXBC_ENTRY = 0x93C00000
+DDR_TRAINED_FAMILIES = {"gemini", "cygnus"}
+GXMT_MAGIC = b"GXMT"
+
+
+def parse_int(value: str) -> int:
+    """Parse decimal or 0x-prefixed hexadecimal integers."""
+    return int(value, 0)
+
+
+def _windows_com_number(device: str):
+    """Return the COM number from COMx / \\\\.\\COMx / //./COMx, else None."""
+    cleaned = device.strip().rstrip(":").replace("/", "\\")
+    match = re.fullmatch(
+        r"(?:\\\\\?\\)?(?:\\\\\.\\)?COM(\d+)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return int(match.group(1))
+    if cleaned.isdigit():
+        return int(cleaned)
+    return None
+
+
+def normalize_serial_device(device: str) -> str:
+    """Return a pyserial port name valid on this OS.
+
+    Windows CreateFile() often fails for bare ``COM3`` (ENOENT) unless the
+    ``\\\\.\\COM3`` device namespace is used; COM10+ always needs that prefix.
+    MSYS/Cygwin Python uses POSIX open() and also cannot open a bare ``COM3``.
+    """
+    device = device.strip()
+    com_num = _windows_com_number(device)
+    if com_num is None:
+        return device
+    platform = sys.platform
+    if os.name == "nt" or platform == "win32":
+        return rf"\\.\COM{com_num}"
+    if platform.startswith("cygwin"):
+        return f"/dev/ttyS{com_num - 1}"
+    if platform.startswith(("msys", "mingw")):
+        return f"//./COM{com_num}"
+    return device
+
+
+def serial_drain(ser) -> None:
+    if ser is None:
+        return
+    if termios is not None:
+        try:
+            termios.tcdrain(ser.fileno())
+            return
+        except (OSError, ValueError, AttributeError, termios.error):
+            pass
+    try:
+        ser.flush()
+    except (OSError, TypeError, serial.SerialException):
+        pass
+
+
+def serial_flush(ser) -> None:
+    if ser is None:
+        return
+    if termios is not None:
+        try:
+            termios.tcflush(ser.fileno(), termios.TCIOFLUSH)
+            return
+        except (OSError, ValueError, AttributeError, termios.error):
+            pass
+    try:
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+    except (OSError, TypeError, serial.SerialException):
+        pass
+
+
+def print_serial_open_help(device: str) -> None:
+    if os.name == "nt":
+        print("[!] Windows needs the COMx name from Device Manager -> Ports.")
+        print("[!] Close other programs using the port (PuTTY, Tera Term, tio).")
+    try:
+        from serial.tools import list_ports
+        ports = list(list_ports.comports())
+    except Exception:
+        ports = []
+    if ports:
+        print("[*] Detected serial ports:")
+        for info in ports:
+            print(f"    {info.device}: {info.description}")
+    elif os.name == "nt":
+        print("[!] No COM ports detected. Install/check the USB-UART driver.")
+
+
+TFTP_RRQ = 1
+TFTP_WRQ = 2
+TFTP_DATA = 3
+TFTP_ACK = 4
+TFTP_ERROR = 5
+TFTP_OACK = 6
+TFTP_BLOCK = 512
+TFTP_PORT = 2000
+
+
+def detect_local_ip() -> str:
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        return probe.getsockname()[0]
+    finally:
+        probe.close()
+
+
+def next_ipv4(ip: str) -> str:
+    value = struct.unpack("!I", socket.inet_aton(ip))[0] + 1
+    return socket.inet_ntoa(struct.pack("!I", value & 0xFFFFFFFF))
+
+
+def parse_tftp_request(data: bytes):
+    opcode = struct.unpack("!H", data[:2])[0]
+    parts = data[2:].split(b"\x00")
+    filename = parts[0].decode("latin-1", errors="replace") if parts else ""
+    mode = parts[1].decode("latin-1", errors="replace").lower() if len(parts) > 1 else "octet"
+    options = {}
+    index = 2
+    while index + 1 < len(parts) and parts[index]:
+        options[parts[index].decode("latin-1", errors="replace").lower()] = parts[index + 1].decode("latin-1", errors="replace")
+        index += 2
+    return opcode, filename, mode, options
+
+
+class TftpServer:
+    """Minimal TFTP server matching gxdl.elf (UDP port 2000, octet/netascii).
+
+    GxLoader's TFTP client is picky: keep the transfer on the well-known port
+    instead of switching to a new TID the way RFC 1350 servers do.
+    """
+
+    def __init__(self, port: int = TFTP_PORT, timeout: float = 5.0, bind_ip: str = ""):
+        self.port = port
+        self.timeout = timeout
+        self.bind_ip = bind_ip or ""
+        self._thread = None
+        self._listen = None
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self.error = None
+        self.received_path = None
+        self._mode = None
+        self._path = None
+        self._send_data = None
+        self._expected_size = None
+
+    def start_receive(self, path: str, expected_size: int | None = None):
+        self._mode = "recv"
+        self._path = Path(path)
+        self._expected_size = expected_size
+        self._start()
+
+    def start_send(self, path: str, data: bytes):
+        self._mode = "send"
+        self._path = Path(path)
+        self._send_data = data
+        self._start()
+
+    def _start(self):
+        self._stop.clear()
+        self._done.clear()
+        self.error = None
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def wait(self, timeout: float) -> bool:
+        return self._done.wait(timeout) and self.error is None
+
+    def stop(self):
+        self._stop.set()
+        listen = self._listen
+        if listen is not None:
+            try:
+                listen.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _serve(self):
+        listen = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._listen = listen
+        try:
+            listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listen.bind((self.bind_ip, self.port))
+            listen.settimeout(0.5)
+            while not self._stop.is_set():
+                try:
+                    data, addr = listen.recvfrom(4 + 8192)
+                except socket.timeout:
+                    continue
+                opcode, filename, mode, options = parse_tftp_request(data)
+                print(f"[*] TFTP opcode {opcode} from {addr[0]}:{addr[1]} name={filename!r} mode={mode}")
+                listen.settimeout(self.timeout)
+                if self._mode == "recv" and opcode == TFTP_WRQ:
+                    self._receive_file(listen, addr, options)
+                    return
+                if self._mode == "send" and opcode == TFTP_RRQ:
+                    self._send_file(listen, addr, options)
+                    return
+                self._send_error(listen, addr, 4, "Unexpected TFTP opcode")
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            try:
+                listen.close()
+            except OSError:
+                pass
+            self._done.set()
+
+    def _ack(self, sock, addr, block: int):
+        sock.sendto(struct.pack("!HH", TFTP_ACK, block), addr)
+
+    def _send_error(self, sock, addr, code: int, message: str):
+        payload = struct.pack("!HH", TFTP_ERROR, code) + message.encode("ascii", errors="replace") + b"\x00"
+        sock.sendto(payload, addr)
+
+    def _receive_file(self, sock, addr, options):
+        try:
+            # GxLoader advertises blksize=1024 but its WRQ path expects ACK 0,
+            # not OACK. Vendor tftpd does the same in receive_file().
+            advertised = int(options.get("blksize", TFTP_BLOCK)) if options else TFTP_BLOCK
+            blksize = TFTP_BLOCK
+            self._ack(sock, addr, 0)
+            expected = 1
+            retries = 0
+            bytes_received = 0
+            sock.settimeout(1.0)
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._path, "wb") as handle:
+                while not self._stop.is_set():
+                    try:
+                        data, addr = sock.recvfrom(4 + max(advertised, TFTP_BLOCK, blksize))
+                    except socket.timeout:
+                        retries += 1
+                        if retries > 8:
+                            # GxLoader omits the RFC empty last DATA packet
+                            # when the file length is an exact multiple of blksize.
+                            if bytes_received > 0 and bytes_received % blksize == 0:
+                                break
+                            raise TimeoutError("timed out waiting for TFTP DATA")
+                        self._ack(sock, addr, expected - 1 if expected > 1 else 0)
+                        continue
+                    retries = 0
+                    opcode = struct.unpack("!H", data[:2])[0]
+                    if opcode == TFTP_WRQ:
+                        _, _, _, new_options = parse_tftp_request(data)
+                        advertised = int(new_options.get("blksize", TFTP_BLOCK)) if new_options else TFTP_BLOCK
+                        blksize = TFTP_BLOCK
+                        self._ack(sock, addr, 0)
+                        expected = 1
+                        bytes_received = 0
+                        handle.seek(0)
+                        handle.truncate()
+                        continue
+                    if opcode != TFTP_DATA or len(data) < 4:
+                        continue
+                    block = struct.unpack("!H", data[2:4])[0]
+                    chunk = data[4:]
+                    if expected == 1 and len(chunk) > blksize:
+                        blksize = len(chunk)
+                    if block == expected:
+                        handle.write(chunk)
+                        bytes_received += len(chunk)
+                        self._ack(sock, addr, block)
+                        if len(chunk) < blksize:
+                            break
+                        if self._expected_size is not None and bytes_received >= self._expected_size:
+                            break
+                        expected = (expected + 1) & 0xFFFF
+                    elif block == ((expected - 1) & 0xFFFF):
+                        self._ack(sock, addr, block)
+            self.received_path = str(self._path)
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self._done.set()
+
+    def _recv_ack(self, sock, expected_block: int):
+        try:
+            ack, addr = sock.recvfrom(32)
+        except socket.timeout:
+            return None, None
+        if len(ack) < 4:
+            return None, addr
+        opcode, block = struct.unpack("!HH", ack[:4])
+        if opcode == TFTP_ACK and block == expected_block:
+            return True, addr
+        return False, addr
+
+    def _send_file(self, sock, addr, options):
+        try:
+            data = self._send_data if self._send_data is not None else self._path.read_bytes()
+            blksize = int(options.get("blksize", TFTP_BLOCK)) if options else TFTP_BLOCK
+            sock.settimeout(1.0)
+            # Vendor tftpd OACKs RRQ blksize, then send_file(). GxLoader may ACK 0
+            # or start waiting for DATA; do not abort the transfer either way.
+            if options:
+                oack = struct.pack("!H", TFTP_OACK)
+                for key, value in options.items():
+                    oack += key.encode("ascii") + b"\x00" + str(value).encode("ascii") + b"\x00"
+                for _ in range(9):
+                    sock.sendto(oack, addr)
+                    ok, new_addr = self._recv_ack(sock, 0)
+                    if new_addr is not None:
+                        addr = new_addr
+                    if ok:
+                        break
+            offset = 0
+            block = 1
+            while not self._stop.is_set():
+                chunk = data[offset:offset + blksize]
+                packet = struct.pack("!HH", TFTP_DATA, block) + chunk
+                acked = False
+                for _ in range(9):
+                    sock.sendto(packet, addr)
+                    ok, new_addr = self._recv_ack(sock, block)
+                    if new_addr is not None:
+                        addr = new_addr
+                    if ok:
+                        acked = True
+                        break
+                if not acked:
+                    if offset + len(chunk) >= len(data):
+                        break
+                    raise TimeoutError("timed out waiting for TFTP ACK")
+                offset += len(chunk)
+                if len(chunk) < blksize:
+                    break
+                block = (block + 1) & 0xFFFF
+        except Exception as exc:
+            self.error = str(exc)
+        finally:
+            self._done.set()
+
+
+def parse_target_catalog(image: bytes):
+    """Extra chip IDs from toob[0x0C:0x20], or None if the field is unused."""
+    if len(image) < 0x20 or image[0x0C:0x10] != GXMT_MAGIC:
+        return None
+    if image[0x10] != 1 or image[0x11] > 6:
+        return None
+    return [struct.unpack_from("<H", image, 0x12 + index * 2)[0]
+            for index in range(image[0x11])]
+
+
+def header_supported_chip_ids(image: bytes):
+    if len(image) < 8 or image[:4] != b"toob":
+        return []
+    ids = [struct.unpack_from("<H", image, 6)[0]]
+    extras = parse_target_catalog(image)
+    if extras:
+        for chip in extras:
+            if chip not in ids:
+                ids.append(chip)
+    return ids
+
+
+def parse_gxid(buffer: bytes):
+    """Parse the stage-1 GXID line. Hosts must ignore BootROM junk until this."""
+    match = GXID_RE.search(buffer)
+    if not match:
+        return None
+    return {
+        "family": match.group(1).decode("ascii"),
+        "name": match.group(2).decode("ascii"),
+    }
+
+
+def wrap_gxbc(payload: bytes, entry: int = GXBC_ENTRY) -> bytes:
+    checksum = sum(payload) & 0xFFFFFFFF
+    return struct.pack("<IIII", GXBC_MAGIC, len(payload), entry, checksum) + payload
+
+
+def family_trains_ddr(family: str) -> bool:
+    return family in DDR_TRAINED_FAMILIES
+
+
+def bootcode_filename_for_family(family: str):
+    if family == "gemini":
+        return "gx6702-bootcode.bin"
+    if family == "cygnus":
+        return "gx6706-bootcode.bin"
+    return None
+
+
+def bootcode_build_hint(family: str) -> str:
+    if family == "gemini":
+        return "make bootcode"
+    if family == "cygnus":
+        return "make SOC=gx6706 bootcode"
+    return "pass --bootcode <file>"
+
+
+def select_open_ipl_stage2(gxid, bootcode_path):
+    """Decide Stage 2 after GXID. Never send the UART stub as vendor GxLoader."""
+    if gxid is None:
+        return "vendor"
+    if not family_trains_ddr(gxid["family"]):
+        return "detect_only"
+    if bootcode_path:
+        return "gxbc"
+    return "missing_bootcode"
+
+
+def is_uart_ipl_stub(boot_data: bytes) -> bool:
+    """Single 8 KiB UART envelope, or that prefix plus an optional GXAI catalog."""
+    if len(boot_data) < 0x2020 or boot_data[:4] != b"toob":
+        return False
+    if len(boot_data) == 0x2020:
+        return True
+    return boot_data[0x2020:0x2024] == b"GXAI"
+
+
+def stage1_8k_parts(boot_data: bytes):
+    """Shared Gemini/Cygnus BootROM UART Stage 1: 0x59 / 0x0800 / 8188 / boot."""
+    header = struct.pack("<BHH", 0x59, 0x0800, 0x0000)
+    payload = boot_data[0x20:0x20 + 8188]
+    return header, payload, b"boot"
 
 
 class GXUploader:
     def __init__(self, device: str, baudrate: int = 115200, verbose: bool = False, skip_warnings: bool = False):
         self.verbose = verbose
-        self.device = device
+        self.device = normalize_serial_device(device)
         self.baudrate = baudrate
         self.ser = None
         self.reset_dtr = False
         self.reset_rts = False
         self.skip_warnings = skip_warnings
+        self.last_rx = b""
+        self.last_gxid = None
+        self.bootcode_path = None
+        self.bootcode_dir = None
+        self.boot_file = None
+        self.chip_override = None
+        self.pcip = None
+        self.stbip = None
+        self.tftp_port = TFTP_PORT
 
     def log(self, msg: str):
         if self.verbose:
@@ -81,39 +529,48 @@ class GXUploader:
 
     def open(self):
         """Open serial port with exact settings matching vendor strace"""
-        self.ser = serial.Serial(
-            port=self.device,
-            baudrate=self.baudrate,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=0.1,
-            xonxoff=False,    # No software flow control
-            rtscts=False,     # No hardware flow control
-            dsrdtr=False,     # No DSR/DTR flow control
-            write_timeout=5.0,
-            inter_byte_timeout=None
-        )
+        try:
+            self.ser = serial.Serial(
+                port=self.device,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=0.1,
+                xonxoff=False,    # No software flow control
+                rtscts=False,     # No hardware flow control
+                dsrdtr=False,     # No DSR/DTR flow control
+                write_timeout=5.0,
+                inter_byte_timeout=None
+            )
+        except serial.SerialException as exc:
+            print(f"[!] Serial error: {exc}")
+            print_serial_open_help(self.device)
+            raise
         
         # Apply vendor-exact termios settings (from strace ioctl analysis)
-        # Key: INPCK flag and raw mode as vendor uses
-        fd = self.ser.fileno()
-        attrs = termios.tcgetattr(fd)
-        
-        # c_iflag: INPCK only (input parity checking)
-        attrs[0] = termios.INPCK
-        # c_oflag: 0 (no output processing)
-        attrs[1] = 0
-        # c_cflag: keep existing (CS8|CREAD|HUPCL|CLOCAL|B115200)
-        # c_lflag: 0 (raw mode)
-        attrs[3] = 0
-        
-        # Apply settings
-        termios.tcsetattr(fd, termios.TCSANOW, attrs)
-        
-        # Do TCSBRK (drain) and TCFLSH (flush) like vendor
-        termios.tcdrain(fd)
-        termios.tcflush(fd, termios.TCIOFLUSH)
+        # Key: INPCK flag and raw mode as vendor uses. Windows has no termios;
+        # pyserial already configured 8N1 above.
+        if termios is not None:
+            fd = self.ser.fileno()
+            attrs = termios.tcgetattr(fd)
+            
+            # c_iflag: INPCK only (input parity checking)
+            attrs[0] = termios.INPCK
+            # c_oflag: 0 (no output processing)
+            attrs[1] = 0
+            # c_cflag: keep existing (CS8|CREAD|HUPCL|CLOCAL|B115200)
+            # c_lflag: 0 (raw mode)
+            attrs[3] = 0
+            
+            # Apply settings
+            termios.tcsetattr(fd, termios.TCSANOW, attrs)
+            
+            # Do TCSBRK (drain) and TCFLSH (flush) like vendor
+            termios.tcdrain(fd)
+            termios.tcflush(fd, termios.TCIOFLUSH)
+        else:
+            serial_flush(self.ser)
         
         # Set RTS and DTR low initially
         self.ser.rts = False
@@ -187,7 +644,11 @@ class GXUploader:
         
         while time.time() - start_time < timeout:
             # Read all available data at once for speed
-            waiting = self.ser.in_waiting
+            try:
+                waiting = self.ser.in_waiting
+            except OSError as exc:
+                print(f"[!] Serial I/O error while waiting for handshake: {exc}")
+                return False
             if waiting > 0:
                 data = self.ser.read(waiting)
                 buffer.extend(data)
@@ -297,6 +758,12 @@ class GXUploader:
                         ch = chr(b) if 32 <= b < 127 else '.'
                         print(f"    Rx: 0x{b:02X} '{ch}'")
 
+                parsed = parse_gxid(buffer)
+                if parsed and not family_trains_ddr(parsed["family"]):
+                    print("[+] Detection-only GXID; no DDR training (untested)")
+                    self._record_runget(buffer)
+                    return True
+
                 # Check for RUN / GET as standalone tokens (not embedded)
                 if not got_run and run_token_re.search(buffer):
                     print("[*] Received RUN")
@@ -307,16 +774,19 @@ class GXUploader:
                     got_get = True
 
                 if got_run and got_get:
+                    self._record_runget(buffer)
                     return True
 
                 # Accept RUN followed by short silence as success
                 if got_run and (time.time() - last_rx_time) > 1.0:
                     print("[*] Got RUN, proceeding without explicit GET")
+                    self._record_runget(buffer)
                     return True
 
                 # Fallback: tolerant regex-based RUNGET detection
                 if runget_re.search(buffer):
                     print("[*] Detected RUNGET variant (tolerant match)")
+                    self._record_runget(buffer)
                     return True
 
                 # Ordered-subsequence detection: allow RUNGET letters to appear
@@ -345,6 +815,7 @@ class GXUploader:
 
                 if ordered_subsequence(buffer, b"RUNGET", max_gap=40):
                     print("[*] Detected RUNGET variant (ordered subsequence)")
+                    self._record_runget(buffer)
                     return True
             else:
                 time.sleep(0.005)
@@ -365,7 +836,15 @@ class GXUploader:
             print("    - Device is in wrong state (try power cycle)")
             print("    - Serial TX line issue (check wiring)")
 
+        self._record_runget(buffer)
         return False
+
+    def _record_runget(self, buffer):
+        self.last_rx = bytes(buffer)
+        self.last_gxid = parse_gxid(self.last_rx)
+        if self.last_gxid:
+            print(f"[+] GXID family={self.last_gxid['family']} "
+                  f"name={self.last_gxid['name']}")
 
     @staticmethod
     def _build_stage2_parts(boot_data: bytes) -> tuple:
@@ -429,6 +908,51 @@ class GXUploader:
         self.log(f"  Total Stage 2: {total} bytes")
         return True
 
+    def send_payload_stage2(self, payload: bytes) -> bool:
+        """Open-IPL Stage 2: checksum32 + size32 + raw payload (GXBC or GXUB)."""
+        checksum32 = sum(payload) & 0xFFFFFFFF
+        meta_part1 = struct.pack("<I", checksum32)
+        meta_part2 = struct.pack("<I", len(payload))
+        self.log(f"  Payload checksum: 0x{checksum32:08X} size={len(payload)}")
+        self.ser.write(meta_part1)
+        self.ser.write(meta_part2)
+        chunk_size = 2048
+        sent = 0
+        while sent < len(payload):
+            chunk = payload[sent:sent + chunk_size]
+            self.ser.write(chunk)
+            sent += len(chunk)
+            pct = (sent * 100) // len(payload) if payload else 100
+            print(f"\r  Progress: {pct}%", end="", flush=True)
+        print()
+        self.ser.flush()
+        return True
+
+    def _resolve_stub_bootcode(self):
+        if self.bootcode_path:
+            path = Path(self.bootcode_path)
+            return path if path.is_file() else None
+        if not self.last_gxid:
+            return None
+        name = bootcode_filename_for_family(self.last_gxid["family"])
+        if not name:
+            return None
+        candidates = []
+        if self.bootcode_dir:
+            candidates.append(Path(self.bootcode_dir) / name)
+        if self.boot_file:
+            candidates.append(Path(self.boot_file).expanduser().resolve().parent / name)
+        candidates.append(Path.cwd() / name)
+        seen = set()
+        for path in candidates:
+            resolved = path.resolve() if path.exists() else path
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if path.is_file():
+                return path
+        return None
+
     def read_response(self, timeout: float = 10.0):
         """Read and print device response after boot"""
         self.log("Reading device response...")
@@ -459,6 +983,7 @@ class GXUploader:
 
     def upload(self, boot_file: str) -> bool:
         """Main upload sequence"""
+        self.boot_file = boot_file
         # Load boot file
         with open(boot_file, "rb") as f:
             boot_data = f.read()
@@ -479,6 +1004,12 @@ class GXUploader:
         chip = struct.unpack("<H", boot_data[6:8])[0]
         baud = struct.unpack("<I", boot_data[8:12])[0]
         print(f"    Version: 0x{version:04X}, Chip: 0x{chip:04X}, Baud: {baud}")
+        # GXMT is host metadata; zeros here is normal. Stage 2 follows GXID.
+        extras = parse_target_catalog(boot_data)
+        if extras:
+            listed = ", ".join(f"0x{c:04X}" for c in extras)
+            print(f"    Header catalog extra IDs: {listed}")
+            print("    UART Stage 1 is still sent once (offset 6 / 8 KiB stub layout)")
         
         # Pre-build Stage 1 parts based on strace analysis
         header, payload, marker = self._build_stage1_parts(boot_data)
@@ -498,8 +1029,7 @@ class GXUploader:
             self.log("Sending Stage 1...")
             
             # Flush buffers before sending (like vendor does)
-            fd = self.ser.fileno()
-            termios.tcflush(fd, termios.TCIOFLUSH)
+            serial_flush(self.ser)
             
             # Send header (5 bytes)
             self.ser.write(header)
@@ -514,22 +1044,42 @@ class GXUploader:
             self.ser.write(marker)
             self.log(f"  Stage marker: {marker}")
             
-            # Drain output buffer to ensure physical transmission (like vendor)
-            termios.tcdrain(fd)
+            serial_drain(self.ser)
             
             total_sent = len(header) + len(payload) + len(marker)
             self.log(f"  Total Stage 1: {total_sent} bytes")
             
-            # Step 3: Wait for RUNGET
+            # Step 3: Wait for RUNGET (or detection-only GXID)
             if not self.wait_for_run_get(timeout=10.0):
                 print("[!] Failed to get RUNGET response")
                 print("[!] Device may have timed out - try again with faster reset")
                 return False
-            
-            # Step 4: Small delay then send Stage 2
+
+            if self.last_gxid and not family_trains_ddr(self.last_gxid["family"]):
+                print("[+] No Stage 2: this family has no open DDR init")
+                return True
+
+            # Step 4: After GXID, send family bootcode as GXBC.
+            # Reconstructing this 8 KiB stub as vendor Stage 2 is a toob+8K
+            # image without GXUB and halts the open IPL with EBUNDLE.
             time.sleep(0.05)  # 50ms
-            if not self.send_stage2(boot_data):
+            bootcode = self._resolve_stub_bootcode()
+            action = select_open_ipl_stage2(self.last_gxid, bootcode)
+            if action == "gxbc":
+                print(f"[+] Sending GXBC from {bootcode}")
+                payload = wrap_gxbc(bootcode.read_bytes())
+                if not self.send_payload_stage2(payload):
+                    return False
+            elif action == "missing_bootcode":
+                name = bootcode_filename_for_family(self.last_gxid["family"])
+                hint = bootcode_build_hint(self.last_gxid["family"])
+                print("[!] GXID received; matching bootcode is not present")
+                print(f"[!] Need {name} ({hint}) or --bootcode <file>")
+                print("[!] Not sending the UART stub as Stage 2 (that causes EBUNDLE)")
                 return False
+            elif action == "vendor":
+                if not self.send_stage2(boot_data):
+                    return False
             
             # Step 5: Read response
             print("\n[+] Boot sequence complete, reading device output:")
@@ -540,7 +1090,9 @@ class GXUploader:
             print("\n[+] Upload successful!")
             return True
             
-        except serial.SerialException as e:
+        except serial.SerialException:
+            return False
+        except OSError as e:
             print(f"[!] Serial error: {e}")
             return False
         except KeyboardInterrupt:
@@ -563,12 +1115,13 @@ class GXUploader:
             raise ValueError("boot data is too short to contain a chip ID")
 
         chip_id = struct.unpack("<H", boot_data[6:8])[0]
+        if self.chip_override is not None and not is_uart_ipl_stub(boot_data):
+            chip_id = self.chip_override
+        if is_uart_ipl_stub(boot_data) or chip_id in (0x6616, 0x3211, 0x6701, 0x6705):
+            return stage1_8k_parts(boot_data)
         if chip_id == 0x6612:
             transfer_size = 0x4000
             payload = boot_data[0x20:transfer_size]
-        elif chip_id in (0x6616, 0x3211, 0x6701, 0x6705):
-            transfer_size = 0x2000
-            payload = boot_data[0x20:0x20 + transfer_size - 4]
         else:
             transfer_size = 0x1000
             payload = boot_data[0x20:0x20 + transfer_size - 4]
@@ -585,7 +1138,6 @@ class GXUploader:
         buffer = bytearray()
         start = time.time()
         poked = False
-        fd = self.ser.fileno()
         
         while time.time() - start < timeout:
             if self.ser.in_waiting:
@@ -598,7 +1150,7 @@ class GXUploader:
                 if not poked and time.time() - start > 0.2:
                     try:
                         self.ser.write(b"\n")
-                        termios.tcdrain(fd)
+                        serial_drain(self.ser)
                     except Exception:
                         pass
                     poked = True
@@ -617,7 +1169,7 @@ class GXUploader:
         
         # Send command with newline
         self.ser.write(command.encode() + b"\n")
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         
         # Wait for echo and capture any extra data
         buffer = bytearray()
@@ -866,7 +1418,7 @@ class GXUploader:
             if progress % 5 == 0:
                 print(f"  Progress: {progress}%", end="\r")
         
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         print(f"  Progress: 100%")
         
         # Wait for ~crc~ marker from device
@@ -890,7 +1442,7 @@ class GXUploader:
         checksum_final = checksum & 0xFFFFFFFF
         checksum_bytes = struct.pack(">I", checksum_final)  # Big-endian
         self.ser.write(checksum_bytes)
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         self.log(f"Sent checksum: 0x{checksum_final:08X} (bytes: {checksum_bytes.hex()})")
         
         # Wait for completion - device will show ~fin~, then erase, write, and possibly reboot
@@ -1003,7 +1555,7 @@ class GXUploader:
                 if len(args) < 3:
                     print(f"[!] Invalid serialdump entry in config: {' '.join(parts)}")
                     return False
-                target, size, output_file = args[0], int(args[1]), args[2]
+                target, size, output_file = args[0], parse_int(args[1]), args[2]
                 if not self.serial_dump(target, size, output_file):
                     return False
             elif command == "flash":
@@ -1017,7 +1569,7 @@ class GXUploader:
                         print(f"[!] Invalid flash erase entry in config: {' '.join(parts)}")
                         return False
                     target = args[args_start]
-                    length = int(args[args_start + 1]) if len(args) > args_start + 1 else None
+                    length = parse_int(args[args_start + 1]) if len(args) > args_start + 1 else None
                     if not self.flash_erase(target, length, nospread):
                         return False
                 elif args[0] == "badinfo":
@@ -1025,6 +1577,22 @@ class GXUploader:
                         return False
                 elif args[0] == "eraseall":
                     if not self.flash_eraseall():
+                        return False
+                elif args[0] == "scrub":
+                    if len(args) == 2 and args[1] == "all":
+                        if not self.flash_scrub():
+                            return False
+                    elif len(args) >= 3:
+                        if not self.flash_scrub(args[1], args[2]):
+                            return False
+                    else:
+                        print(f"[!] Invalid flash scrub entry in config: {' '.join(parts)}")
+                        return False
+                elif args[0] == "mark":
+                    if len(args) < 3 or args[1] != "bad":
+                        print(f"[!] Invalid flash mark entry in config: {' '.join(parts)}")
+                        return False
+                    if not self.flash_mark_bad(args[2]):
                         return False
                 else:
                     print(f"[!] Unsupported flash command in config: {' '.join(parts)}")
@@ -1059,7 +1627,7 @@ class GXUploader:
         # Send command
         self.log(f"Sending text command: {command}")
         self.ser.write(command.encode() + b"\n")
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         
         # Read response until we see boot> prompt again
         buffer = bytearray()
@@ -1276,7 +1844,7 @@ class GXUploader:
             if progress % 5 == 0:
                 print(f"  Progress: {progress}%", end="\r")
 
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         print("  Progress: 100%")
 
         # Wait for ~crc~
@@ -1297,7 +1865,7 @@ class GXUploader:
         # Send checksum (GX custom)
         checksum_bytes = struct.pack(">I", checksum & 0xFFFFFFFF)
         self.ser.write(checksum_bytes)
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         self.log(f"Sent checksum: 0x{(checksum & 0xFFFFFFFF):08X}")
 
         # Wait for completion
@@ -1421,7 +1989,7 @@ class GXUploader:
             if progress % 5 == 0:
                 print(f"  Progress: {progress}%", end="\r")
 
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         print("  Progress: 100%")
 
         # Wait for ~crc~
@@ -1442,7 +2010,7 @@ class GXUploader:
         # Send checksum (GX custom)
         checksum_bytes = struct.pack(">I", checksum & 0xFFFFFFFF)
         self.ser.write(checksum_bytes)
-        termios.tcdrain(self.ser.fileno())
+        serial_drain(self.ser)
         self.log(f"Sent checksum: 0x{(checksum & 0xFFFFFFFF):08X}")
 
         # Wait for completion
@@ -1486,6 +2054,52 @@ class GXUploader:
         result = self.text_command(command, timeout=30.0)
         if result:
             print(f"[+] sflash_otp erase response:\n{result}")
+        return True
+
+    def sflash_otp_lock(self) -> bool:
+        """Lock SPI Flash OTP (DANGEROUS / irreversible). Vendor: sflash_otp %s."""
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        print("[!] WARNING: sflash_otp lock is irreversible on parts that support it.")
+        if not self.confirm_action(
+            "This will lock SPI Flash OTP.",
+            "Proceed with sflash_otp lock?",
+        ):
+            return False
+
+        result = self.text_command("sflash_otp lock", timeout=30.0)
+        if result:
+            print(f"[+] sflash_otp lock response:\n{result}")
+        return True
+
+    def sflash_otp_setregion(self, region: str) -> bool:
+        """Select SPI Flash OTP region. Vendor: sflash_otp %s %s."""
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        print("[!] WARNING: sflash_otp setregion changes OTP region selection.")
+        if not self.confirm_action(
+            f"This will set SPI Flash OTP region to {region}.",
+            "Proceed with sflash_otp setregion?",
+        ):
+            return False
+
+        command = f"sflash_otp setregion {region}"
+        print(f"[*] {command}")
+        result = self.text_command(command, timeout=30.0)
+        if result:
+            print(f"[+] sflash_otp setregion response:\n{result}")
         return True
 
     def compare_files(self, src_file: str, dst_file: str) -> bool:
@@ -1710,6 +2324,136 @@ class GXUploader:
         
         return True
 
+    def flash_scrub(self, address: str | None = None, length: str | None = None) -> bool:
+        """NAND scrub. Vendor sends the CLI string through argv2str (untested here)."""
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        if address is None:
+            command = "flash scrub all"
+            timeout = 300.0
+        else:
+            if length is None:
+                print("[!] Usage: flash scrub <flash addr> <length>")
+                return False
+            command = f"flash scrub {address} {length}"
+            timeout = 120.0
+
+        print(f"[*] {command}")
+        print("[!] WARNING: scrub is DANGEROUS!!! Factory set bad blocks will be lost")
+        if not self.confirm_action(
+            "This will scrub NAND and can discard factory bad-block markers.",
+            "Proceed with flash scrub?",
+        ):
+            return False
+
+        result = self.text_command(command, timeout=timeout)
+        if result:
+            print(f"[+] Flash scrub output:\n{result}")
+        return True
+
+    def flash_mark_bad(self, address: str) -> bool:
+        """Mark a NAND block bad. Vendor sends the CLI string through argv2str (untested here)."""
+        if not self.ser or not self.ser.is_open:
+            print("[!] Serial port not open")
+            return False
+
+        if not self.wait_for_prompt(timeout=2.0):
+            print("[!] Not at boot> prompt")
+            return False
+
+        command = f"flash mark bad {address}"
+        print(f"[*] {command}")
+        print("[!] WARNING: this permanently marks a block bad in the BBT.")
+        if not self.confirm_action(
+            f"This will mark flash address {address} as bad.",
+            "Proceed with flash mark bad?",
+        ):
+            return False
+
+        result = self.text_command(command, timeout=30.0)
+        if result:
+            print(f"[+] Flash mark bad output:\n{result}")
+        return True
+
+    def _resolve_net_ips(self):
+        pcip = self.pcip or detect_local_ip()
+        stbip = self.stbip or next_ipv4(pcip)
+        return pcip, stbip
+
+    def net_configure(self, stbip: str, tftp_port: int = TFTP_PORT) -> bool:
+        """Bring up GxLoader networking the way gxdl.elf does."""
+        ip_result = self.text_command(f"config ip {stbip}", timeout=30.0)
+        if ip_result:
+            print(ip_result)
+        port_result = self.text_command(f"config tftpport {tftp_port}", timeout=10.0)
+        if port_result:
+            print(port_result)
+        return True
+
+    def net_dump(self, target: str, size: int, output_file: str) -> bool:
+        """Dump flash to the host over TFTP (device WRQ to UDP port 2000)."""
+        pcip, stbip = self._resolve_net_ips()
+        output_path = Path(output_file)
+        if output_path.exists():
+            output_path.unlink()
+        print(f"[*] TFTP netdump: board {stbip} -> host {pcip}:{self.tftp_port}")
+        if not self.net_configure(stbip, self.tftp_port):
+            return False
+        server = TftpServer(port=self.tftp_port, bind_ip=pcip, timeout=8.0)
+        server.start_receive(str(output_path), expected_size=size)
+        try:
+            time.sleep(0.2)
+            command = f"netdump {target} {pcip} {output_path.name} {size}"
+            print(f"[*] {command}")
+            result = self.text_command(command, timeout=max(30.0, size / 50000.0 + 20.0))
+            if result:
+                print(result)
+            if not server.wait(timeout=8.0):
+                print(f"[!] TFTP receive failed: {server.error or 'timeout'}")
+                return False
+            received = output_path.stat().st_size if output_path.exists() else 0
+            print(f"[+] Wrote {received} bytes to {output_path}")
+            return received > 0
+        finally:
+            server.stop()
+
+    def net_download(self, target: str, input_file: str) -> bool:
+        """Write a host file to flash over TFTP (device RRQ from UDP port 2000)."""
+        if not self.confirm_action(
+            "netdown writes flash over TFTP and can brick the device.",
+            "Proceed with netdown?",
+        ):
+            return False
+        pcip, stbip = self._resolve_net_ips()
+        path = Path(input_file)
+        data = path.read_bytes()
+        print(f"[*] TFTP netdown: host {pcip}:{self.tftp_port} -> board {stbip}")
+        if not self.net_configure(stbip, self.tftp_port):
+            return False
+        server = TftpServer(port=self.tftp_port, bind_ip=pcip, timeout=8.0)
+        server.start_send(path.name, data)
+        try:
+            time.sleep(0.2)
+            command = f'partition download {target} {pcip} "{path.name}" {len(data)}'
+            print(f"[*] {command}")
+            xfer_timeout = max(60.0, len(data) / 30000.0 + 30.0)
+            result = self.text_command(command, timeout=xfer_timeout)
+            if result:
+                print(result)
+            if not server.wait(timeout=xfer_timeout):
+                print(f"[!] TFTP send failed: {server.error or 'timeout'}")
+                return False
+            print(f"[+] Sent {len(data)} bytes from {path}")
+            return True
+        finally:
+            server.stop()
+
     def run_command_mode(self, boot_file: str, command: str, cmd_args: list, transfer_mode: str = "s") -> bool:
         """
         Boot device and run a command.
@@ -1732,19 +2476,22 @@ class GXUploader:
             if not self.upload(boot_file):
                 print("[!] Failed to boot device")
                 return False
-            self.open()
+            try:
+                self.open()
+            except serial.SerialException:
+                return False
             time.sleep(0.5)
             if self.ser is not None:
                 self.ser.reset_input_buffer()
                 self.ser.write(b"\n")
-                try:
-                    termios.tcdrain(self.ser.fileno())
-                except (termios.error, OSError):
-                    pass
+                serial_drain(self.ser)
                 time.sleep(0.1)
         else:
             if not self.ser or not self.ser.is_open:
-                self.open()
+                try:
+                    self.open()
+                except serial.SerialException:
+                    return False
             if not self.wait_for_prompt(timeout=2.0):
                 print("[!] Not at boot> prompt; cannot use transfer mode nns")
                 return False
@@ -1752,10 +2499,7 @@ class GXUploader:
             if self.ser is not None:
                 self.ser.reset_input_buffer()
                 self.ser.write(b"\n")
-                try:
-                    termios.tcdrain(self.ser.fileno())
-                except (termios.error, OSError):
-                    pass
+                serial_drain(self.ser)
                 time.sleep(0.1)
 
         # Handle the command
@@ -1763,7 +2507,7 @@ class GXUploader:
             if len(cmd_args) < 3:
                 print("[!] Usage: serialdump <partition|addr> <size> <output_file>")
                 return False
-            target, size, output_file = cmd_args[0], int(cmd_args[1]), cmd_args[2]
+            target, size, output_file = cmd_args[0], parse_int(cmd_args[1]), cmd_args[2]
             return self.serial_dump(target, size, output_file)
         
         elif command == "serialdown":
@@ -1783,14 +2527,14 @@ class GXUploader:
                 if len(cmd_args) < 4:
                     print("[!] Usage: gx_otp read <address> <length> <output_file>")
                     return False
-                addr, length, output_file = int(cmd_args[1]), int(cmd_args[2]), cmd_args[3]
+                addr, length, output_file = parse_int(cmd_args[1]), parse_int(cmd_args[2]), cmd_args[3]
                 return self.gx_otp_read(addr, length, output_file)
             
             elif subcmd == "tread":
                 if len(cmd_args) < 3:
                     print("[!] Usage: gx_otp tread <address> <length>")
                     return False
-                addr, length = int(cmd_args[1]), int(cmd_args[2])
+                addr, length = parse_int(cmd_args[1]), parse_int(cmd_args[2])
                 result = self.gx_otp_tread(addr, length)
                 if result:
                     print(f"[+] GX OTP data:\n{result}")
@@ -1800,14 +2544,14 @@ class GXUploader:
                 if len(cmd_args) < 3:
                     print("[!] Usage: gx_otp write <address> <input_file>")
                     return False
-                addr = int(cmd_args[1])
+                addr = parse_int(cmd_args[1])
                 input_file = cmd_args[2]
                 return self.gx_otp_write(addr, input_file)
             elif subcmd == "twrite":
                 if len(cmd_args) < 3:
                     print("[!] Usage: gx_otp twrite <address> <hex_digits_string>")
                     return False
-                addr = int(cmd_args[1])
+                addr = parse_int(cmd_args[1])
                 hex_string = cmd_args[2]
                 return self.gx_otp_twrite(addr, hex_string)
             else:
@@ -1816,7 +2560,7 @@ class GXUploader:
         
         elif command == "sflash_otp":
             if len(cmd_args) < 1:
-                print("[!] Usage: sflash_otp <status|getregion|read|write|erase> [args...]")
+                print("[!] Usage: sflash_otp <status|getregion|read|write|erase|lock|setregion> [args...]")
                 return False
             
             subcmd = cmd_args[0]
@@ -1838,19 +2582,29 @@ class GXUploader:
                 if len(cmd_args) < 4:
                     print("[!] Usage: sflash_otp read <address> <length> <output_file>")
                     return False
-                addr, length, output_file = int(cmd_args[1]), int(cmd_args[2]), cmd_args[3]
+                addr, length, output_file = parse_int(cmd_args[1]), parse_int(cmd_args[2]), cmd_args[3]
                 return self.sflash_otp_read(addr, length, output_file)
             
             elif subcmd == "write":
                 if len(cmd_args) < 3:
                     print("[!] Usage: sflash_otp write <address> <input_file>")
                     return False
-                addr = int(cmd_args[1])
+                addr = parse_int(cmd_args[1])
                 input_file = cmd_args[2]
                 return self.sflash_otp_write(addr, input_file)
 
             elif subcmd == "erase":
                 return self.sflash_otp_erase()
+
+            elif subcmd == "lock":
+                return self.sflash_otp_lock()
+
+            elif subcmd == "setregion":
+                if len(cmd_args) < 2:
+                    print("[!] Usage: sflash_otp setregion <num>")
+                    return False
+                parse_int(cmd_args[1])
+                return self.sflash_otp_setregion(cmd_args[1])
             
             else:
                 print(f"[!] Unknown sflash_otp subcommand: {subcmd}")
@@ -1867,7 +2621,7 @@ class GXUploader:
                 print("[!] Usage: usbdump <partition|addr> <size> <filename>")
                 print("[!] Note: filename is on USB drive attached to device")
                 return False
-            target, size, filename = cmd_args[0], int(cmd_args[1]), cmd_args[2]
+            target, size, filename = cmd_args[0], parse_int(cmd_args[1]), cmd_args[2]
             return self.usb_dump(target, size, filename)
         
         elif command == "usbdown":
@@ -1898,7 +2652,7 @@ class GXUploader:
         
         elif command == "flash":
             if len(cmd_args) < 1:
-                print("[!] Usage: flash <erase|badinfo|eraseall> [args...]")
+                print("[!] Usage: flash <erase|badinfo|eraseall|scrub|mark> [args...]")
                 return False
             
             subcmd = cmd_args[0]
@@ -1919,7 +2673,7 @@ class GXUploader:
                     return False
                 
                 target = cmd_args[args_start]
-                length = int(cmd_args[args_start + 1]) if len(cmd_args) > args_start + 1 else None
+                length = parse_int(cmd_args[args_start + 1]) if len(cmd_args) > args_start + 1 else None
                 return self.flash_erase(target, length, nospread)
             
             elif subcmd == "badinfo":
@@ -1927,11 +2681,52 @@ class GXUploader:
             
             elif subcmd == "eraseall":
                 return self.flash_eraseall()
+
+            elif subcmd == "scrub":
+                if len(cmd_args) < 2:
+                    print("[!] Usage: flash scrub <flash addr> <length>")
+                    print("[!]        flash scrub all")
+                    return False
+                if cmd_args[1] == "all":
+                    return self.flash_scrub()
+                if len(cmd_args) < 3:
+                    print("[!] Usage: flash scrub <flash addr> <length>")
+                    return False
+                parse_int(cmd_args[1])
+                parse_int(cmd_args[2])
+                return self.flash_scrub(cmd_args[1], cmd_args[2])
+
+            elif subcmd == "mark":
+                if len(cmd_args) < 3 or cmd_args[1] != "bad":
+                    print("[!] Usage: flash mark bad <flash addr>")
+                    return False
+                parse_int(cmd_args[2])
+                return self.flash_mark_bad(cmd_args[2])
             
             else:
                 print(f"[!] Unknown flash subcommand: {subcmd}")
-                print("[!] Available: erase, badinfo, eraseall")
+                print("[!] Available: erase, badinfo, eraseall, scrub, mark")
                 return False
+
+        elif command == "netdump":
+            if len(cmd_args) < 3:
+                print("[!] Usage: netdump <partition|addr> <size> <output_file>")
+                return False
+            target, size, output_file = cmd_args[0], parse_int(cmd_args[1]), cmd_args[2]
+            return self.net_dump(target, size, output_file)
+
+        elif command == "netdown":
+            if len(cmd_args) < 2:
+                print("[!] Usage: netdown <partition|addr> <input_file>")
+                return False
+            target, input_file = cmd_args[0], cmd_args[1]
+            return self.net_download(target, input_file)
+
+        elif command == "net":
+            result = self.text_command("net " + " ".join(cmd_args), timeout=30.0)
+            if result:
+                print(result)
+            return True
         
         else:
             print(f"[!] Unknown command: {command}")
@@ -1940,10 +2735,77 @@ class GXUploader:
             print("    usbdump, usbdown        - USB flash read/write")
             print("    gx_otp                  - GX OTP read")
             print("    sflash_otp              - SPI Flash OTP operations")
-            print("    flash                   - Flash management (erase, badinfo)")
+            print("    flash                   - Flash management (erase, badinfo, scrub, mark)")
             print("    compare                 - Compare two files (host-side)")
+            print("    netdump, netdown, net   - Ethernet TFTP flash read/write")
             return False
         
+
+
+def _install_data_roots() -> list[Path]:
+    """Prefix/data roots pip uses on POSIX, macOS, and Windows."""
+    roots: list[Path] = []
+    for value in (sysconfig.get_path("data"), sys.prefix, getattr(site, "USER_BASE", None)):
+        if value:
+            roots.append(Path(value))
+    try:
+        user_data = sysconfig.get_path("data", sysconfig.get_preferred_scheme("user"))
+    except (AttributeError, LookupError, TypeError, ValueError):
+        user_data = None
+    if user_data:
+        roots.append(Path(user_data))
+    unique: list[Path] = []
+    for root in roots:
+        if root not in unique:
+            unique.append(root)
+    return unique
+
+
+def packaged_loaders_dir() -> Path:
+    """Directory that contains bundled GxLoader .boot files.
+
+    setuptools data-files use the portable key ``share/libre-gxdl/loaders``;
+    pathlib turns that into ``share\\libre-gxdl\\loaders`` on Windows. The
+    install root still differs (venv prefix, ``~/.local``, ``~/Library/Python``,
+    ``%APPDATA%\\Python``), so search the wheel RECORD first, then every
+    sysconfig data root.
+    """
+    candidates = [Path(__file__).resolve().parent / "loaders"]
+    try:
+        for entry in distribution_files("libre-gxdl") or ():
+            if entry.name.endswith(".boot"):
+                located = entry.locate()
+                if located is not None:
+                    parent = Path(located).resolve().parent
+                    if parent not in candidates:
+                        candidates.insert(0, parent)
+                    break
+    except PackageNotFoundError:
+        pass
+    for root in _install_data_roots():
+        for relative in (
+            Path("share") / "libre-gxdl" / "loaders",
+            Path("libre-gxdl") / "loaders",
+        ):
+            path = root / relative
+            if path not in candidates:
+                candidates.append(path)
+    for path in candidates:
+        if path.is_dir() and any(path.glob("*.boot")):
+            return path
+    return candidates[0]
+
+
+def resolve_boot_file(boot: str) -> str:
+    """Return a usable boot path, including packaged loaders after install."""
+    given = Path(boot)
+    if given.exists():
+        return boot
+    loaders = packaged_loaders_dir()
+    for candidate in (loaders / boot, loaders / given.name):
+        if candidate.exists():
+            return str(candidate)
+    return boot
 
 
 def build_argument_parser():
@@ -2002,11 +2864,16 @@ Commands:
     sflash_otp read <addr> <len> <file>       - Read OTP to file
     sflash_otp write <addr> <file>            - Write OTP (binary) [DANGEROUS]
     sflash_otp erase                          - Erase OTP region [DANGEROUS]
+    sflash_otp lock                           - Lock OTP [DANGEROUS]
+    sflash_otp setregion <num>                - Select OTP region [DANGEROUS]
   
   Flash Management:
     flash badinfo                             - Show bad block info
     flash erase [nospread] <partition|addr> [len] - Erase flash region
     flash eraseall                            - Erase ENTIRE flash (DANGER!)
+    flash scrub <addr> <length>               - NAND scrub range [DANGEROUS]
+    flash scrub all                           - NAND scrub entire device [DANGEROUS]
+    flash mark bad <addr>                     - Mark NAND block bad [DANGEROUS]
   
   Utilities:
     compare <src_file> <dst_file>             - Compare two files (host-side)
@@ -2018,8 +2885,13 @@ Tips:
   - USB commands require USB storage connected to the device formatted as FAT32
         """
     )
-    parser.add_argument("-b", "--boot", required=True, help="Boot file to upload")
-    parser.add_argument("-d", "--device", required=True, help="Serial device (e.g., /dev/ttyUSB0)")
+    parser.add_argument("-b", "--boot", required=True, help="Boot file to upload (path or name from packaged loaders)")
+    parser.add_argument(
+        "-d",
+        "--device",
+        required=True,
+        help="Serial device (e.g. /dev/ttyUSB0, COM3, or \\\\.\\COM3)",
+    )
     parser.add_argument("-c", "--command", help="Bootloader command to execute after boot")
     parser.add_argument("-t", "--transfer-mode", default="s", choices=["s", "nns"], help="Transfer mode for the bootloader upload: s (send boot image) or nns (skip boot image when already in command mode)")
     parser.add_argument("-y", "--yes", action="store_true", help="Skip destructive-operation confirmation prompts")
@@ -2027,18 +2899,32 @@ Tips:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument("--reset-dtr", action="store_true", help="Pulse DTR to reset device")
     parser.add_argument("--reset-rts", action="store_true", help="Pulse RTS to reset device")
-    parser.add_argument("--loopback-test", action="store_true", help="Test serial loopback (TX→RX)")
+    parser.add_argument("--loopback-test", action="store_true", help="Test serial loopback (TX -> RX)")
+    parser.add_argument("--bootcode", help="DDR bootcode binary sent as GXBC after GXID")
+    parser.add_argument("--bootcode-dir", help="Directory containing gx6702-bootcode.bin / gx6706-bootcode.bin")
+    parser.add_argument("--chip", type=lambda v: int(v, 0),
+                        help="Override vendor GxLoader chip ID for Stage 1 size (ignored for UART stub)")
+    parser.add_argument("-p", "--pcip", help="Host IP for TFTP (default: auto-detect)")
+    parser.add_argument("-s", "--stbip", help="Board IP (default: host IP + 1)")
+    parser.add_argument("--tftp-port", type=int, default=TFTP_PORT, help="TFTP port (vendor default 2000)")
     return parser
 
 
 def main():
     parser = build_argument_parser()
     args = parser.parse_args()
+    args.boot = resolve_boot_file(args.boot)
     
     if args.loopback_test:
         # Simple loopback test
         print("[*] Serial loopback test - short TX to RX pins first!")
-        ser = serial.Serial(args.device, args.baud, timeout=1)
+        device = normalize_serial_device(args.device)
+        try:
+            ser = serial.Serial(device, args.baud, timeout=1)
+        except serial.SerialException as exc:
+            print(f"[!] Serial error: {exc}")
+            print_serial_open_help(device)
+            sys.exit(1)
         test_data = b"LOOPBACK_TEST_12345"
         ser.write(test_data)
         ser.flush()
@@ -2058,6 +2944,12 @@ def main():
     # Set reset options
     uploader.reset_dtr = args.reset_dtr
     uploader.reset_rts = args.reset_rts
+    uploader.bootcode_path = args.bootcode
+    uploader.bootcode_dir = args.bootcode_dir
+    uploader.chip_override = args.chip
+    uploader.pcip = args.pcip
+    uploader.stbip = args.stbip
+    uploader.tftp_port = args.tftp_port
     
     if args.command:
         # Parse command

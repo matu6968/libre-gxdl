@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "libre-gxdl"
+version = "0.1.0"
+description = "Open source NationalChip GX series flasher tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pyserial",
+]
+
+[project.scripts]
+libre-gxdl = "libre_gxdl:main"
+
+[tool.setuptools]
+py-modules = ["libre_gxdl"]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"share/libre-gxdl/loaders" = ["loaders/*.boot"]

@@ -1,0 +1,2 @@
+include LICENSE README.md PROTOCOL.md
+recursive-include loaders *.boot
